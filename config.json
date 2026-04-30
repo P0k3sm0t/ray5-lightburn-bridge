@@ -1,0 +1,47 @@
+{
+  "ray5_host": "10.0.0.195",
+  "ray5_port": 8848,
+  "listen_host": "127.0.0.1",
+  "listen_port": 9000,
+  "protocol_type": "http",
+  "connect_timeout_seconds": 3.0,
+  "read_timeout_seconds": 1.0,
+  "log_file": "bridge.log",
+  "newline": "\n",
+  "status_poll_interval_seconds": 0.0,
+  "tcp": {
+    "recv_chunk_size": 4096
+  },
+  "websocket": {
+    "url": "ws://10.0.0.195:8849/ws",
+    "subprotocols": [],
+    "origin": null,
+    "append_newline": false,
+    "open_timeout_seconds": 5.0,
+    "close_timeout_seconds": 1.0
+  },
+  "http": {
+    "url": "http://10.0.0.195:8848/command",
+    "method": "GET",
+    "content_type": "",
+    "headers": {},
+    "body_mode": "query_param",
+    "body_template": "{command}",
+    "command_field": "commandText",
+    "response_field": "",
+    "append_newline_to_body": false,
+    "synthetic_status_response": "<Idle|MPos:0.000,0.000,0.000|FS:0,0>",
+    "spool": {
+      "enabled": true,
+      "idle_seconds": 1.5,
+      "minimum_job_lines": 10,
+      "gzip_level": 6,
+      "filename_prefix": "lightburn_job",
+      "upload_url": "http://10.0.0.195:8848/upload",
+      "upload_path": "/",
+      "files_url": "http://10.0.0.195:8848/files",
+      "upload_timeout_seconds": 30.0,
+      "run_command_template": "$sd/runzip=/{filename}"
+    }
+  }
+}
