@@ -240,6 +240,7 @@ class HttpUpstream(UpstreamBase):
         self._spool_job_started = False
         self._spool_filename: str | None = None
         self._spool_run_started_at: float | None = None
+        self._spool_last_upload_only = False
         self._spool_upload_thread: threading.Thread | None = None
         self._spool_counter = 0
         self._spool_enabled = bool(self.spool_config.get("enabled", False))
@@ -385,20 +386,22 @@ class HttpUpstream(UpstreamBase):
             return
 
         try:
-            filename = self._upload_and_start_spooled_job(lines)
+            filename, started = self._upload_and_maybe_start_spooled_job(lines)
         except Exception as exc:
             self.log.exception("Failed to upload/start spooled job")
             self.handler.forward_upstream_data(f"error: spool upload failed: {exc}\n".encode("utf-8"))
             with self._spool_lock:
                 self._spool_filename = None
                 self._spool_run_started_at = None
+                self._spool_last_upload_only = False
             return
 
         with self._spool_lock:
             self._spool_filename = filename
-            self._spool_run_started_at = time.time()
+            self._spool_run_started_at = time.time() if started else None
+            self._spool_last_upload_only = not started
 
-    def _upload_and_start_spooled_job(self, lines: list[str]) -> str:
+    def _upload_and_maybe_start_spooled_job(self, lines: list[str]) -> tuple[str, bool]:
         filename = self._next_spool_filename()
         body = ("\n".join(lines) + "\n").encode("utf-8")
         compressed = gzip.compress(body, compresslevel=int(self.spool_config.get("gzip_level", 6)))
@@ -437,11 +440,16 @@ class HttpUpstream(UpstreamBase):
             except requests.RequestException:
                 self.log.warning("File list verification failed", exc_info=True)
 
+        start_after_upload = bool(self.spool_config.get("start_after_upload", True))
+        if not start_after_upload:
+            self.log.info("Spool uploaded %s and left it on SD without starting", filename)
+            return filename, False
+
         run_command = run_command_template.format(filename=filename)
         self.log.info("Spool starting uploaded file with %r", run_command)
         start_response = self._issue_http_command(run_command)
         self.log.info("Spool start response %r", start_response.strip())
-        return filename
+        return filename, True
 
     def _next_spool_filename(self) -> str:
         prefix = self.spool_config.get("filename_prefix", "lightburn_job")
@@ -458,10 +466,14 @@ class HttpUpstream(UpstreamBase):
                 return f"<Run|Buf:{buffered}|FS:0,0|MSG:buffering>"
             filename = self._spool_filename
             started_at = self._spool_run_started_at
+            upload_only = self._spool_last_upload_only
 
         if filename and started_at:
             elapsed = time.time() - started_at
             return f"<Run|MPos:0.000,0.000,0.000|FS:0,0|SD:0.00,/{filename}|time:{elapsed:.3f}>"
+
+        if filename and upload_only:
+            return f"<Idle|MPos:0.000,0.000,0.000|FS:0,0|SD:0.00,/{filename}|MSG:uploaded>"
 
         return self.http_config.get(
             "synthetic_status_response",
@@ -660,8 +672,9 @@ def main() -> int:
     )
     spool_config = config.get("http", {}).get("spool", {})
     logging.info(
-        "HTTP spool mode: enabled=%s idle_seconds=%s minimum_job_lines=%s",
+        "HTTP spool mode: enabled=%s start_after_upload=%s idle_seconds=%s minimum_job_lines=%s",
         spool_config.get("enabled", False),
+        spool_config.get("start_after_upload", True),
         spool_config.get("idle_seconds", "n/a"),
         spool_config.get("minimum_job_lines", "n/a"),
     )

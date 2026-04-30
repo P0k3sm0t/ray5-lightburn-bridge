@@ -33,6 +33,7 @@
     "synthetic_status_response": "<Idle|MPos:0.000,0.000,0.000|FS:0,0>",
     "spool": {
       "enabled": true,
+      "start_after_upload": false,
       "idle_seconds": 1.5,
       "minimum_job_lines": 10,
       "gzip_level": 6,
