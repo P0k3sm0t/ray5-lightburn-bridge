@@ -110,6 +110,8 @@ Instead of streaming every command live, it:
 4. Uploads it to the Ray5
 5. Either starts it with `$sd/runzip=/filename.gc.gz` or leaves it on SD for manual start
 
+By default, upload-only mode now sends a plain `.gc` file so it more closely matches the ESP32 web UI upload behavior and is more likely to appear as a playable SD job.
+
 This is still experimental, but it is the closest match so far to LaserBurn's "send to machine, then run from SD" workflow. If you only want to upload without starting, set `http.spool.start_after_upload` to `false` in `config.json`.
 
 ## Safe discovery notes

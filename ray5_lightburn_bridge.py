@@ -15,7 +15,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import requests
 
@@ -402,9 +401,16 @@ class HttpUpstream(UpstreamBase):
             self._spool_last_upload_only = not started
 
     def _upload_and_maybe_start_spooled_job(self, lines: list[str]) -> tuple[str, bool]:
-        filename = self._next_spool_filename()
+        start_after_upload = bool(self.spool_config.get("start_after_upload", True))
+        compress_upload = self.spool_config.get("compress_upload")
+        if compress_upload is None:
+            compress_upload = start_after_upload
+
+        filename = self._next_spool_filename(compress_upload)
         body = ("\n".join(lines) + "\n").encode("utf-8")
-        compressed = gzip.compress(body, compresslevel=int(self.spool_config.get("gzip_level", 6)))
+        upload_bytes = body
+        if compress_upload:
+            upload_bytes = gzip.compress(body, compresslevel=int(self.spool_config.get("gzip_level", 6)))
 
         upload_url = self.spool_config.get("upload_url")
         if not upload_url:
@@ -412,14 +418,16 @@ class HttpUpstream(UpstreamBase):
         upload_path = self.spool_config.get("upload_path", "/")
         files_url = self.spool_config.get("files_url")
         run_command_template = self.spool_config.get("run_command_template", "$sd/runzip=/{filename}")
+        multipart_filename = self.spool_config.get("multipart_filename_mode", "leading_slash")
+        posted_filename = f"/{filename}" if multipart_filename == "leading_slash" else filename
 
-        self.log.info("Spool uploading %s (%d lines, %d bytes compressed)", filename, len(lines), len(compressed))
+        upload_kind = "compressed" if compress_upload else "plain"
+        self.log.info("Spool uploading %s (%d lines, %d bytes, %s)", filename, len(lines), len(upload_bytes), upload_kind)
         try:
             response = self.session.post(
                 upload_url,
-                params={"path": upload_path},
-                data={"path": upload_path, "size": str(len(compressed))},
-                files={"file": (filename, compressed, "application/octet-stream")},
+                data={"path": upload_path, "size": str(len(upload_bytes))},
+                files={"file": (posted_filename, upload_bytes, "application/octet-stream")},
                 timeout=max(self.connect_timeout, float(self.spool_config.get("upload_timeout_seconds", 30.0))),
             )
         except requests.RequestException as exc:
@@ -440,7 +448,6 @@ class HttpUpstream(UpstreamBase):
             except requests.RequestException:
                 self.log.warning("File list verification failed", exc_info=True)
 
-        start_after_upload = bool(self.spool_config.get("start_after_upload", True))
         if not start_after_upload:
             self.log.info("Spool uploaded %s and left it on SD without starting", filename)
             return filename, False
@@ -451,13 +458,14 @@ class HttpUpstream(UpstreamBase):
         self.log.info("Spool start response %r", start_response.strip())
         return filename, True
 
-    def _next_spool_filename(self) -> str:
+    def _next_spool_filename(self, compress_upload: bool) -> str:
         prefix = self.spool_config.get("filename_prefix", "lightburn_job")
         timestamp = time.strftime("%Y%m%d_%H%M%S")
+        extension = ".gc.gz" if compress_upload else ".gc"
         with self._spool_lock:
             self._spool_counter += 1
             counter = self._spool_counter
-        return f"{prefix}_{timestamp}_{counter:03d}.gc.gz"
+        return f"{prefix}_{timestamp}_{counter:03d}{extension}"
 
     def _build_status_line(self) -> str:
         with self._spool_lock:
@@ -672,9 +680,10 @@ def main() -> int:
     )
     spool_config = config.get("http", {}).get("spool", {})
     logging.info(
-        "HTTP spool mode: enabled=%s start_after_upload=%s idle_seconds=%s minimum_job_lines=%s",
+        "HTTP spool mode: enabled=%s start_after_upload=%s compress_upload=%s idle_seconds=%s minimum_job_lines=%s",
         spool_config.get("enabled", False),
         spool_config.get("start_after_upload", True),
+        spool_config.get("compress_upload", "auto"),
         spool_config.get("idle_seconds", "n/a"),
         spool_config.get("minimum_job_lines", "n/a"),
     )

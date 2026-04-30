@@ -42,7 +42,9 @@
       "upload_path": "/",
       "files_url": "http://10.0.0.195:8848/files",
       "upload_timeout_seconds": 30.0,
-      "run_command_template": "$sd/runzip=/{filename}"
+      "run_command_template": "$sd/runzip=/{filename}",
+      "compress_upload": false,
+      "multipart_filename_mode": "leading_slash"
     }
   }
 }
