@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-04-30T14:31:35",
-  "host": "10.0.0.195",
+  "host": "192.168.1.50",
   "ports": [
     80,
     23,
@@ -160,7 +160,7 @@
       "websocket": {
         "paths": [
           {
-            "url": "ws://10.0.0.195:8849/ws",
+            "url": "ws://192.168.1.50:8849/ws",
             "accepted": true,
             "messages": [
               {
@@ -191,7 +191,7 @@
             ]
           },
           {
-            "url": "ws://10.0.0.195:8849/websocket",
+            "url": "ws://192.168.1.50:8849/websocket",
             "accepted": true,
             "messages": [
               {
@@ -220,7 +220,7 @@
             ]
           },
           {
-            "url": "ws://10.0.0.195:8849/socket",
+            "url": "ws://192.168.1.50:8849/socket",
             "accepted": true,
             "messages": [
               {
@@ -250,7 +250,7 @@
             ]
           },
           {
-            "url": "ws://10.0.0.195:8849/",
+            "url": "ws://192.168.1.50:8849/",
             "accepted": true,
             "messages": [
               {

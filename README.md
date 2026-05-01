@@ -113,6 +113,59 @@ If LightBurn is running on a different machine than the bridge, use the bridge c
 python .\ray5_lightburn_bridge.py --config .\config.json
 ```
 
+## First-time configuration
+
+The bundled `config.json` uses safe generic example values. Before using the bridge on a real machine, update these fields for your own network:
+
+- `ray5_host`
+  - set this to your Ray5's IP address
+- `websocket.url`
+  - usually `ws://YOUR_RAY5_IP:8849/ws`
+- `http.url`
+  - usually `http://YOUR_RAY5_IP:8848/command`
+- `http.spool.upload_url`
+  - usually `http://YOUR_RAY5_IP:8848/upload`
+- `http.spool.files_url`
+  - usually `http://YOUR_RAY5_IP:8848/files`
+
+You may also want to adjust these local bridge settings:
+
+- `listen_host`
+  - use `127.0.0.1` if LightBurn runs on the same computer as the bridge
+  - use your bridge computer's LAN IP if LightBurn runs on a different machine
+- `listen_port`
+  - default is `9000`
+  - change it only if that port conflicts with something else on your system
+
+### Example
+
+If your Ray5 is at `192.168.1.77`, the important config values would look like:
+
+```json
+{
+  "ray5_host": "192.168.1.77",
+  "listen_host": "127.0.0.1",
+  "listen_port": 9000,
+  "websocket": {
+    "url": "ws://192.168.1.77:8849/ws"
+  },
+  "http": {
+    "url": "http://192.168.1.77:8848/command",
+    "spool": {
+      "upload_url": "http://192.168.1.77:8848/upload",
+      "files_url": "http://192.168.1.77:8848/files"
+    }
+  }
+}
+```
+
+After that, point LightBurn at:
+
+- Address: `127.0.0.1`
+- Port: `9000`
+
+If LightBurn is on another computer, use the bridge computer's LAN IP instead of `127.0.0.1`.
+
 ## How spool mode works
 
 Instead of streaming every command live, spool mode can:

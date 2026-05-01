@@ -1,8 +1,8 @@
 # Ray5 LaserBurn Capture Notes
 
-Status: probe results are now available for `10.0.0.195`, but no live LaserBurn packet capture was available in this workspace yet. This file records the confirmed service layout plus the exact capture plan for the LaserBurn-specific handshake.
+Status: sanitized sample probe results are included for `192.168.1.50`, but no live LaserBurn packet capture is bundled in this repo. This file records the confirmed service layout plus the exact capture plan for the LaserBurn-specific handshake.
 
-## Confirmed probe findings for 10.0.0.195
+## Confirmed probe findings for 192.168.1.50
 
 - Date: `2026-04-30`
 - Open ports found:
@@ -27,10 +27,10 @@ Status: probe results are now available for `10.0.0.195`, but no live LaserBurn 
   - `Server: arduino-WebSocket-Server`
   - body: `This is a Websocket server only!`
 - WebSocket connections succeeded on:
-  - `ws://10.0.0.195:8849/ws`
-  - `ws://10.0.0.195:8849/websocket`
-  - `ws://10.0.0.195:8849/socket`
-  - `ws://10.0.0.195:8849/`
+  - `ws://192.168.1.50:8849/ws`
+  - `ws://192.168.1.50:8849/websocket`
+  - `ws://192.168.1.50:8849/socket`
+  - `ws://192.168.1.50:8849/`
 - Raw GRBL query strings sent as WebSocket text did not return GRBL responses. Observed responses included:
   - `CURRENT_ID:0`
   - `ACTIVE_ID:0`
@@ -63,7 +63,7 @@ Status: probe results are now available for `10.0.0.195`, but no live LaserBurn 
 
 ### Connection summary
 
-- Ray5 IP: `10.0.0.195`
+- Ray5 IP: `192.168.1.50`
 - LaserBurn source IP:
 - First destination port:
 - Additional ports touched:
