@@ -1,9 +1,26 @@
-﻿__pycache__/
+﻿# Python
+__pycache__/
 *.pyc
 *.pyo
+
+# Logs / temp
 *.log
 *.tmp
 *.bak
+
+# Virtual environments
 .venv/
 venv/
 .env
+
+# Project-specific (Ray5 bridge)
+config.json
+*.gc
+*.gcode
+*.nc
+*.gc.gz
+spool/
+
+# OS junk
+Thumbs.db
+.DS_Store
