@@ -86,6 +86,7 @@ The default config is now aimed at Ray5 touchscreen selection:
 - `http.spool.start_after_upload: false`
 - `http.spool.upload_format: gc_gz`
 - `http.spool.screen_compatible_rewrite: true`
+- `http.spool.convert_m4_to_m3: false`
 - `http.spool.filename_prefix: longer`
 - `http.spool.filename_mode: short_counter`
 
@@ -203,10 +204,16 @@ For Ray5 touchscreen compatibility, the bridge rewrites uploaded offline jobs to
 This currently includes:
 
 - Longer-style comment header
-- `M4` converted to `M3`
+- optional `M4` to `M3` conversion
 - removal of `M8`
 - LaserBurn-style footer order
 - short Ray5-friendly filenames
+
+By default, `M4` is now preserved so the Ray5 can keep using dynamic laser mode in offline files. If you want the older compatibility behavior, set:
+
+```json
+"convert_m4_to_m3": true
+```
 
 ## Configuration notes
 
@@ -219,6 +226,7 @@ Important settings include:
 - `protocol_type`: currently `http`
 - `http.spool.start_after_upload`: upload only vs auto-run
 - `http.spool.upload_format`: `gc`, `gc_gz`, or `both`
+- `http.spool.convert_m4_to_m3`: `false` to preserve dynamic mode, `true` to force `M3`
 - `http.spool.filename_prefix`: file name prefix
 - `http.spool.filename_mode`: `short_counter` or `timestamp_counter`
 

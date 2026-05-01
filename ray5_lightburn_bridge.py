@@ -494,13 +494,14 @@ class HttpUpstream(UpstreamBase):
 
     def _rewrite_for_screen_compatibility(self, lines: list[str]) -> list[str]:
         normalized: list[str] = []
+        convert_m4_to_m3 = bool(self.spool_config.get("convert_m4_to_m3", False))
         for raw_line in lines:
             line = raw_line.strip()
             if not line or line.startswith(';'):
                 continue
             if line == 'M8':
                 continue
-            if line == 'M4':
+            if convert_m4_to_m3 and line == 'M4':
                 line = 'M3'
             normalized.append(line)
 
@@ -520,13 +521,17 @@ class HttpUpstream(UpstreamBase):
 
         motion_lines: list[str] = []
         current_feed: str | None = None
+        laser_mode = 'M3'
         max_s = 0.0
         xs: list[float] = []
         ys: list[float] = []
         finish_move: str | None = None
 
         for line in motion_source:
-            if line in {'G00 G17 G40 G21 G54', 'G00G17G40G21G54', 'G90', 'M3', 'M9', 'M5', 'M2'}:
+            if line in {'M3', 'M4'}:
+                laser_mode = line
+                continue
+            if line in {'G00 G17 G40 G21 G54', 'G00G17G40G21G54', 'G90', 'M9', 'M5', 'M2'}:
                 continue
 
             line, feed_value = self._extract_feed_token(line)
@@ -578,7 +583,7 @@ class HttpUpstream(UpstreamBase):
             '; Layer C00',
             f'; Line @ {feed_comment} mm/min, {power_percent}% power',
             'G90',
-            'M3',
+            laser_mode,
         ]
         if current_feed:
             result.append(f'F{current_feed}')
@@ -856,11 +861,12 @@ def main() -> int:
     )
     spool_config = config.get("http", {}).get("spool", {})
     logging.info(
-        "HTTP spool mode: enabled=%s start_after_upload=%s upload_format=%s screen_compatible_rewrite=%s idle_seconds=%s minimum_job_lines=%s",
+        "HTTP spool mode: enabled=%s start_after_upload=%s upload_format=%s screen_compatible_rewrite=%s convert_m4_to_m3=%s idle_seconds=%s minimum_job_lines=%s",
         spool_config.get("enabled", False),
-        spool_config.get("start_after_upload", True),
+        spool_config.get("start_after_upload", False),
         spool_config.get("upload_format", "gc_gz"),
         spool_config.get("screen_compatible_rewrite", True),
+        spool_config.get("convert_m4_to_m3", False),
         spool_config.get("idle_seconds", "n/a"),
         spool_config.get("minimum_job_lines", "n/a"),
     )

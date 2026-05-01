@@ -46,6 +46,7 @@
       "multipart_filename_mode": "bare",
       "upload_format": "gc_gz",
       "screen_compatible_rewrite": true,
+      "convert_m4_to_m3": false,
       "gzip_os_byte": 3,
       "upload_query_path": true,
       "filename_mode": "short_counter"
