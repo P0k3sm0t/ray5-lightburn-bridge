@@ -1,11 +1,11 @@
-﻿GitHub repo name:
+GitHub repo name:
 ray5-lightburn-bridge
 
 GitHub description:
-A local TCP-to-Ray5 bridge that lets LightBurn talk to a Longer Ray5 over Wi-Fi using GRBL Ethernet/TCP, with HTTP bridging and experimental SD spool/upload mode.
+A LightBurn-to-Ray5 Wi-Fi bridge that provides GRBL Ethernet/TCP compatibility, HTTP control, and touchscreen-friendly SD upload mode for Longer Ray5 lasers.
 
 Short project summary:
-This project bridges LightBurn's GRBL Ethernet/TCP mode to the Longer Ray5's HTTP-based Wi-Fi interface. It supports direct command forwarding, protocol probing, and an experimental SD spool mode that uploads jobs to the Ray5 and starts them from onboard storage to reduce live-stream jitter.
+This project bridges LightBurn's GRBL Ethernet/TCP mode to the Longer Ray5's HTTP-based Wi-Fi interface. It supports live control, protocol probing, and an SD spool mode that uploads Ray5-screen-friendly offline job files such as `longer_001.gc.gz` for manual selection on the machine.
 
 Suggested GitHub topics:
 lightburn
@@ -23,4 +23,4 @@ Suggested first release title:
 v0.1.0 experimental
 
 Suggested first release note:
-Initial public prototype with HTTP bridge, Ray5 probe tooling, protocol notes, and experimental SD spool mode for Longer Ray5 Wi-Fi workflows.
+Initial public prototype with HTTP bridge mode, Ray5 probe tooling, protocol notes, and working upload-only SD spool mode for Ray5 touchscreen file selection.

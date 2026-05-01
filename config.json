@@ -37,14 +37,18 @@
       "idle_seconds": 1.5,
       "minimum_job_lines": 10,
       "gzip_level": 6,
-      "filename_prefix": "lightburn_job",
+      "filename_prefix": "longer",
       "upload_url": "http://10.0.0.195:8848/upload",
       "upload_path": "/",
       "files_url": "http://10.0.0.195:8848/files",
       "upload_timeout_seconds": 30.0,
       "run_command_template": "$sd/runzip=/{filename}",
-      "compress_upload": false,
-      "multipart_filename_mode": "leading_slash"
+      "multipart_filename_mode": "bare",
+      "upload_format": "gc_gz",
+      "screen_compatible_rewrite": true,
+      "gzip_os_byte": 3,
+      "upload_query_path": true,
+      "filename_mode": "short_counter"
     }
   }
 }

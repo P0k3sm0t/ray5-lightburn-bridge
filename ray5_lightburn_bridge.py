@@ -402,15 +402,14 @@ class HttpUpstream(UpstreamBase):
 
     def _upload_and_maybe_start_spooled_job(self, lines: list[str]) -> tuple[str, bool]:
         start_after_upload = bool(self.spool_config.get("start_after_upload", True))
-        compress_upload = self.spool_config.get("compress_upload")
-        if compress_upload is None:
-            compress_upload = start_after_upload
+        upload_format = str(self.spool_config.get("upload_format", "gc_gz")).lower()
+        if upload_format not in {"gc", "gc_gz", "both"}:
+            raise BridgeProtocolError(f"unsupported upload_format: {upload_format}")
 
-        filename = self._next_spool_filename(compress_upload)
-        body = ("\n".join(lines) + "\n").encode("utf-8")
-        upload_bytes = body
-        if compress_upload:
-            upload_bytes = gzip.compress(body, compresslevel=int(self.spool_config.get("gzip_level", 6)))
+        body_lines = list(lines)
+        if bool(self.spool_config.get("screen_compatible_rewrite", True)):
+            body_lines = self._rewrite_for_screen_compatibility(body_lines)
+        body = ("\n".join(body_lines) + "\n").encode("utf-8")
 
         upload_url = self.spool_config.get("upload_url")
         if not upload_url:
@@ -418,22 +417,20 @@ class HttpUpstream(UpstreamBase):
         upload_path = self.spool_config.get("upload_path", "/")
         files_url = self.spool_config.get("files_url")
         run_command_template = self.spool_config.get("run_command_template", "$sd/runzip=/{filename}")
-        multipart_filename = self.spool_config.get("multipart_filename_mode", "leading_slash")
-        posted_filename = f"/{filename}" if multipart_filename == "leading_slash" else filename
 
-        upload_kind = "compressed" if compress_upload else "plain"
-        self.log.info("Spool uploading %s (%d lines, %d bytes, %s)", filename, len(lines), len(upload_bytes), upload_kind)
-        try:
-            response = self.session.post(
-                upload_url,
-                data={"path": upload_path, "size": str(len(upload_bytes))},
-                files={"file": (posted_filename, upload_bytes, "application/octet-stream")},
-                timeout=max(self.connect_timeout, float(self.spool_config.get("upload_timeout_seconds", 30.0))),
-            )
-        except requests.RequestException as exc:
-            raise BridgeProtocolError(f"upload request failed: {exc}") from exc
-        if not response.ok:
-            raise BridgeProtocolError(f"upload failed with HTTP {response.status_code}: {response.text.strip()}")
+        uploads: list[tuple[str, bytes, str]] = []
+        if upload_format in {"gc", "both"}:
+            plain_filename = self._next_spool_filename(False)
+            uploads.append((plain_filename, body, "plain"))
+        if upload_format in {"gc_gz", "both"}:
+            compressed_filename = self._next_spool_filename(True)
+            compressed_bytes = self._make_gzip_bytes(body)
+            uploads.append((compressed_filename, compressed_bytes, "compressed"))
+
+        uploaded_filenames: list[str] = []
+        for filename, upload_bytes, upload_kind in uploads:
+            self._upload_spool_file(upload_url, upload_path, filename, upload_bytes, upload_kind)
+            uploaded_filenames.append(filename)
 
         if files_url:
             self.log.info("Spool listing files via %s", files_url)
@@ -443,29 +440,208 @@ class HttpUpstream(UpstreamBase):
                     params={"path": upload_path},
                     timeout=max(self.connect_timeout, 10.0),
                 )
-                if listing.ok and filename not in listing.text:
-                    self.log.warning("Uploaded filename %s not found in immediate file listing", filename)
+                if listing.ok:
+                    for filename in uploaded_filenames:
+                        if filename not in listing.text:
+                            self.log.warning("Uploaded filename %s not found in immediate file listing", filename)
             except requests.RequestException:
                 self.log.warning("File list verification failed", exc_info=True)
 
+        run_filename = self._pick_run_filename(uploaded_filenames)
         if not start_after_upload:
-            self.log.info("Spool uploaded %s and left it on SD without starting", filename)
-            return filename, False
+            self.log.info("Spool uploaded %s and left it on SD without starting", ", ".join(uploaded_filenames))
+            return run_filename, False
 
-        run_command = run_command_template.format(filename=filename)
+        run_command = run_command_template.format(filename=run_filename)
         self.log.info("Spool starting uploaded file with %r", run_command)
         start_response = self._issue_http_command(run_command)
         self.log.info("Spool start response %r", start_response.strip())
-        return filename, True
+        return run_filename, True
+
+    def _make_gzip_bytes(self, body: bytes) -> bytes:
+        data = bytearray(gzip.compress(body, compresslevel=int(self.spool_config.get("gzip_level", 6))))
+        os_byte = self.spool_config.get("gzip_os_byte")
+        if os_byte is not None and len(data) >= 10:
+            data[9] = int(os_byte) & 0xFF
+        return bytes(data)
+
+    def _upload_spool_file(self, upload_url: str, upload_path: str, filename: str, upload_bytes: bytes, upload_kind: str) -> None:
+        multipart_filename = self.spool_config.get("multipart_filename_mode", "bare")
+        posted_filename = f"/{filename}" if multipart_filename == "leading_slash" else filename
+        use_query_path = bool(self.spool_config.get("upload_query_path", True))
+        query_params = {"path": upload_path} if use_query_path else None
+        self.log.info("Spool uploading %s (%d bytes, %s, query_path=%s, multipart_name=%s)", filename, len(upload_bytes), upload_kind, use_query_path, posted_filename)
+        try:
+            response = self.session.post(
+                upload_url,
+                params=query_params,
+                data={"path": upload_path, "size": str(len(upload_bytes))},
+                files={"file": (posted_filename, upload_bytes, "application/octet-stream")},
+                timeout=max(self.connect_timeout, float(self.spool_config.get("upload_timeout_seconds", 30.0))),
+            )
+        except requests.RequestException as exc:
+            raise BridgeProtocolError(f"upload request failed: {exc}") from exc
+        if not response.ok:
+            raise BridgeProtocolError(f"upload failed with HTTP {response.status_code}: {response.text.strip()}")
+
+    def _pick_run_filename(self, filenames: list[str]) -> str:
+        for filename in filenames:
+            if filename.endswith('.gc.gz'):
+                return filename
+        if filenames:
+            return filenames[0]
+        raise BridgeProtocolError('no uploaded filenames available to run')
+
+    def _rewrite_for_screen_compatibility(self, lines: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith(';'):
+                continue
+            if line == 'M8':
+                continue
+            if line == 'M4':
+                line = 'M3'
+            normalized.append(line)
+
+        footer_start = len(normalized)
+        for idx in range(len(normalized) - 1, -1, -1):
+            if normalized[idx] == 'M9':
+                footer_start = idx
+                break
+        if footer_start == len(normalized):
+            for idx in range(len(normalized) - 1, -1, -1):
+                if normalized[idx] in {'M5', 'M2'}:
+                    footer_start = idx
+                    break
+
+        motion_source = normalized[:footer_start]
+        footer_source = normalized[footer_start:]
+
+        motion_lines: list[str] = []
+        current_feed: str | None = None
+        max_s = 0.0
+        xs: list[float] = []
+        ys: list[float] = []
+        finish_move: str | None = None
+
+        for line in motion_source:
+            if line in {'G00 G17 G40 G21 G54', 'G00G17G40G21G54', 'G90', 'M3', 'M9', 'M5', 'M2'}:
+                continue
+
+            line, feed_value = self._extract_feed_token(line)
+            if feed_value is not None:
+                current_feed = feed_value
+            if not line:
+                continue
+
+            s_value = self._extract_numeric_token(line, 'S')
+            if s_value is not None:
+                max_s = max(max_s, s_value)
+
+            x_value = self._extract_numeric_token(line, 'X')
+            y_value = self._extract_numeric_token(line, 'Y')
+            if x_value is not None:
+                xs.append(x_value)
+            if y_value is not None:
+                ys.append(y_value)
+
+            motion_lines.append(self._compact_gcode_spacing(line))
+
+        footer_seen = set()
+        footer_lines: list[str] = []
+        for line in footer_source:
+            compact = self._compact_gcode_spacing(line)
+            if compact in {'M9', 'M5', 'G90'} and compact not in footer_seen:
+                footer_lines.append(compact)
+                footer_seen.add(compact)
+                continue
+            if compact in {'G1S0', 'G1 S0'} and 'G1 S0' not in footer_seen:
+                footer_lines.append('G1 S0')
+                footer_seen.add('G1 S0')
+                continue
+            if compact.startswith('G0') and 'X0' in compact and 'Y0' in compact:
+                finish_move = compact
+
+        bounds_line = '; Bounds: unknown'
+        if xs and ys:
+            bounds_line = f'; Bounds: X{min(xs):g} Y{min(ys):g} to X{max(xs):g} Y{max(ys):g}'
+
+        feed_comment = current_feed or '0'
+        power_percent = int(round(max_s / 10.0)) if max_s else 0
+
+        result = [
+            '; Longer Laser APP 2.0 - LibGcode Engine',
+            '; GRBL device profile, absolute coords',
+            bounds_line,
+            'G00 G17 G40 G21 G54',
+            '; Layer C00',
+            f'; Line @ {feed_comment} mm/min, {power_percent}% power',
+            'G90',
+            'M3',
+        ]
+        if current_feed:
+            result.append(f'F{current_feed}')
+        result.extend(motion_lines)
+        result.append('')
+        result.append('M9' if 'M9' in footer_seen else 'M9')
+        result.append('G1 S0')
+        result.append('M5' if 'M5' in footer_seen else 'M5')
+        result.append('G90' if 'G90' in footer_seen else 'G90')
+        result.append('; return to user-defined finish pos')
+        result.append(finish_move or 'G0X0Y0')
+        result.append('M2')
+        return result
+
+    def _extract_feed_token(self, line: str) -> tuple[str, str | None]:
+        if 'F' not in line:
+            return line, None
+        idx = line.rfind('F')
+        end = idx + 1
+        while end < len(line) and line[end] in '0123456789.+-':
+            end += 1
+        token = line[idx + 1:end]
+        if not token:
+            return line, None
+        new_line = (line[:idx] + line[end:]).strip()
+        return new_line, token
+
+    def _extract_numeric_token(self, line: str, key: str) -> float | None:
+        idx = line.find(key)
+        if idx == -1:
+            return None
+        start = idx + 1
+        end = start
+        while end < len(line) and line[end] in '0123456789.+-':
+            end += 1
+        token = line[start:end]
+        if not token:
+            return None
+        try:
+            return float(token)
+        except ValueError:
+            return None
+
+    def _compact_gcode_spacing(self, line: str) -> str:
+        parts = line.split()
+        if not parts:
+            return line
+        if parts[0] in {'G0', 'G00', 'G1', 'G01'} and len(parts) > 1:
+            return parts[0] + ''.join(parts[1:])
+        return ''.join(parts) if parts[0].startswith(('X', 'Y', 'S', 'F')) else line
 
     def _next_spool_filename(self, compress_upload: bool) -> str:
-        prefix = self.spool_config.get("filename_prefix", "lightburn_job")
+        prefix = str(self.spool_config.get("filename_prefix", "longer")).strip()
+        filename_mode = str(self.spool_config.get("filename_mode", "short_counter")).strip().lower()
+        separator = "" if not prefix or prefix.endswith(("_", "-")) else "_"
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         extension = ".gc.gz" if compress_upload else ".gc"
         with self._spool_lock:
             self._spool_counter += 1
             counter = self._spool_counter
-        return f"{prefix}_{timestamp}_{counter:03d}{extension}"
+        if filename_mode == "timestamp_counter":
+            return f"{prefix}{separator}{timestamp}_{counter:03d}{extension}"
+        return f"{prefix}{separator}{counter:03d}{extension}"
 
     def _build_status_line(self) -> str:
         with self._spool_lock:
@@ -680,10 +856,11 @@ def main() -> int:
     )
     spool_config = config.get("http", {}).get("spool", {})
     logging.info(
-        "HTTP spool mode: enabled=%s start_after_upload=%s compress_upload=%s idle_seconds=%s minimum_job_lines=%s",
+        "HTTP spool mode: enabled=%s start_after_upload=%s upload_format=%s screen_compatible_rewrite=%s idle_seconds=%s minimum_job_lines=%s",
         spool_config.get("enabled", False),
         spool_config.get("start_after_upload", True),
-        spool_config.get("compress_upload", "auto"),
+        spool_config.get("upload_format", "gc_gz"),
+        spool_config.get("screen_compatible_rewrite", True),
         spool_config.get("idle_seconds", "n/a"),
         spool_config.get("minimum_job_lines", "n/a"),
     )
