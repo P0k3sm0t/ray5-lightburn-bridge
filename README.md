@@ -50,7 +50,7 @@ POST /upload?path=/
 multipart/form-data
 ```
 
-Observed run command:
+Observed compressed run command:
 
 ```text
 $sd/runzip=/filename.gc.gz
@@ -71,7 +71,7 @@ did not reliably appear on the machine screen.
 Short LaserBurn-style names like:
 
 ```text
-longer_001.gc.gz
+longer_001.gcod
 ```
 
 did appear and were selectable from the Ray5 screen.
@@ -84,7 +84,8 @@ The default config is now aimed at Ray5 touchscreen selection:
 
 - `http.spool.enabled: true`
 - `http.spool.start_after_upload: false`
-- `http.spool.upload_format: gc_gz`
+- `http.spool.upload_format: gc`
+- `http.spool.plain_extension: .gcod`
 - `http.spool.screen_compatible_rewrite: true`
 - `http.spool.convert_m4_to_m3: false`
 - `http.spool.filename_prefix: longer`
@@ -93,8 +94,8 @@ The default config is now aimed at Ray5 touchscreen selection:
 That means new offline uploads look like:
 
 ```text
-longer_001.gc.gz
-longer_002.gc.gz
+longer_001.gcod
+longer_002.gcod
 ```
 
 ## LightBurn setup
@@ -113,6 +114,44 @@ If LightBurn is running on a different machine than the bridge, use the bridge c
 ```powershell
 python .\ray5_lightburn_bridge.py --config .\config.json
 ```
+
+## How to use
+
+### Recommended upload-only workflow
+
+This is the most proven workflow right now.
+
+1. Insert the SD card into the Ray5.
+2. Power on the Ray5 and make sure it is not in `Alarm`.
+3. Home the machine if needed.
+4. Start the bridge:
+
+```powershell
+python .\ray5_lightburn_bridge.py --config .\config.json
+```
+
+5. In LightBurn, connect as a `GRBL` `Ethernet/TCP` device at `127.0.0.1:9000`.
+6. Send the job from LightBurn.
+7. Wait for the bridge to finish uploading the file to the Ray5 SD card.
+8. Walk to the Ray5 touchscreen.
+9. Select the uploaded file, usually something like `longer_001.gcod`.
+10. Use `Border` on the Ray5 screen.
+11. Start the job from the Ray5 screen when you are ready.
+
+### What success looks like
+
+- LightBurn connects without GRBL startup errors.
+- Upload finishes without `Alarm` or HTTP upload errors.
+- The Ray5 touchscreen shows the uploaded `longer_###.gcod` file.
+- `Border` works from the Ray5 screen.
+- `Print` runs from the Ray5 screen.
+
+### If it does not work
+
+- If the Ray5 shows `Alarm`, clear the alarm and home/unlock the machine before uploading.
+- If uploads fail, confirm the SD card is inserted.
+- If `Border` fails but `Print` works, make sure `http.spool.upload_format` is `gc`, `http.spool.plain_extension` is `.gcod`, and `http.spool.screen_compatible_rewrite` is `true`.
+- After changing `config.json`, restart the bridge before testing again.
 
 ## First-time configuration
 
@@ -231,6 +270,7 @@ For Ray5 touchscreen compatibility, the bridge rewrites uploaded offline jobs to
 This currently includes:
 
 - Longer-style comment header
+- absolute-coordinate conversion for mixed `G90`/`G91` streamed jobs
 - optional `M4` to `M3` conversion
 - removal of `M8`
 - LaserBurn-style footer order
@@ -263,9 +303,9 @@ Important settings include:
 
 ### Upload format guidance
 
-- `gc_gz`: best match for Ray5 touchscreen offline workflow
-- `gc`: useful for ESP32 web page file playback
-- `both`: uploads both variants
+- `gc`: current best match for Ray5 touchscreen offline workflow when combined with `plain_extension: ".gcod"` and `screen_compatible_rewrite: true`
+- `gc_gz`: may still be useful on some firmware versions, especially for web-started compressed playback
+- `both`: uploads both variants if you want to compare behaviors on your own machine
 
 ## Project files
 
