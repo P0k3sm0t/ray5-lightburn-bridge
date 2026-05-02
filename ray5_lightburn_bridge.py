@@ -348,7 +348,7 @@ class HttpUpstream(UpstreamBase):
         synthetic_reason = self._synthetic_status_query_reason()
         if synthetic_reason is not None:
             status_line = self._build_status_line()
-            self.log.info("Using synthetic status for '?' while %s", synthetic_reason)
+            self.log.debug("Using synthetic status for '?' while %s", synthetic_reason)
             return status_line + "\n"
         response_text = self._issue_http_command("?")
         with self._spool_lock:
@@ -366,7 +366,7 @@ class HttpUpstream(UpstreamBase):
         if not manual_sd_active:
             return True
 
-        self.log.info("Refreshing manual SD run state before handling command %r", command)
+        self.log.debug("Refreshing manual SD run state before handling command %r", command)
         try:
             self._issue_http_command("?")
         except BridgeProtocolError as exc:
@@ -382,7 +382,7 @@ class HttpUpstream(UpstreamBase):
             active_filename = self._spool_filename
 
         if not manual_sd_active:
-            self.log.info("Manual SD run is no longer active; proceeding with command %r", command)
+            self.log.debug("Manual SD run is no longer active; proceeding with command %r", command)
             return True
 
         filename_text = f" {active_filename}" if active_filename else ""
@@ -458,7 +458,7 @@ class HttpUpstream(UpstreamBase):
             )
             stale_sideband_lines = self._drain_sideband_lines()
             if stale_sideband_lines:
-                self.log.info("Discarded stale websocket sideband lines before %r: %r", command, stale_sideband_lines)
+                self.log.debug("Discarded stale websocket sideband lines before %r: %r", command, stale_sideband_lines)
             try:
                 response = self.session.request(
                     method=method,
@@ -495,7 +495,7 @@ class HttpUpstream(UpstreamBase):
                 self.log.info("RX websocket sideband lines for %r: %r", command, lines)
             elif command.startswith("?"):
                 status_line = self._build_status_line()
-                self.log.info("Falling back to synthetic status for '?' because websocket produced no status line")
+                self.log.debug("Falling back to synthetic status for '?' because websocket produced no status line")
                 lines = [status_line]
             else:
                 lines = self._normalize_http_response(command, text)
@@ -626,7 +626,7 @@ class HttpUpstream(UpstreamBase):
             )
             if any(marker in lowered for marker in generic_completion_markers):
                 if self._spool_run_started_at is not None or self._spool_last_upload_only:
-                    self.log.info(
+                    self.log.debug(
                         "Ignoring generic completion-style controller message until SD status/idleness confirms completion: %s",
                         message,
                     )
@@ -1065,12 +1065,8 @@ class HttpUpstream(UpstreamBase):
         except requests.RequestException as exc:
             raise BridgeProtocolError(f"upload request failed: {exc}") from exc
         try:
-            self.log.info(
-                "Spool upload response status=%s reason=%r headers=%r",
-                response.status_code,
-                response.reason,
-                dict(response.headers),
-            )
+            self.log.info("Spool upload response status=%s reason=%r", response.status_code, response.reason)
+            self.log.debug("Spool upload response headers=%r", dict(response.headers))
             if not response.ok:
                 raise BridgeProtocolError(f"upload failed with HTTP {response.status_code}: {response.reason}")
         finally:
@@ -1250,15 +1246,12 @@ class HttpUpstream(UpstreamBase):
             motion_lines.append(self._compact_gcode_spacing(line))
 
         footer_seen = set()
-        footer_lines: list[str] = []
         for line in footer_source:
             compact = self._compact_gcode_spacing(line)
             if compact in {'M9', 'M5', 'G90'} and compact not in footer_seen:
-                footer_lines.append(compact)
                 footer_seen.add(compact)
                 continue
             if compact in {'G1S0', 'G1 S0'} and 'G1 S0' not in footer_seen:
-                footer_lines.append('G1 S0')
                 footer_seen.add('G1 S0')
                 continue
             if compact.startswith('G0') and 'X0' in compact and 'Y0' in compact:
@@ -1285,10 +1278,10 @@ class HttpUpstream(UpstreamBase):
             result.append(f'F{current_feed}')
         result.extend(motion_lines)
         result.append('')
-        result.append('M9' if 'M9' in footer_seen else 'M9')
+        result.append('M9')
         result.append('G1 S0')
-        result.append('M5' if 'M5' in footer_seen else 'M5')
-        result.append('G90' if 'G90' in footer_seen else 'G90')
+        result.append('M5')
+        result.append('G90')
         result.append('; return to user-defined finish pos')
         result.append(finish_move or 'G0X0Y0')
         result.append('M2')
