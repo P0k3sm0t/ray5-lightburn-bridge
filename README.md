@@ -189,6 +189,33 @@ It is intended for the workflow:
 4. frame/border
 5. run manually
 
+### LightBurn frame buttons
+
+The bridge now has a live frame/jog passthrough path for short motion-only sequences that do not contain laser-on commands.
+
+This is meant to help LightBurn features like:
+
+- Frame
+- simple motion previews
+- move-only outline passes without a laser-on command
+
+Relevant config options:
+
+- `http.spool.frame_live_passthrough`
+  - `true` enables live pass-through for short move-only sequences
+  - `false` disables it and leaves all such traffic in the normal spool logic
+- `http.spool.frame_idle_seconds`
+  - how long the bridge waits before treating a short move-only burst as a live frame/jog sequence
+  - default is `0.35`
+- `http.spool.zero_power_frame_passthrough`
+  - `true` lets job-shaped sequences pass live if they contain no positive `S` power values
+  - this helps when LightBurn frames with `M4` present but `S0`
+- `http.spool.synthetic_motion_status_seconds`
+  - how long the bridge should report a temporary synthetic `Run` state after live motion-style commands
+  - default is `2.0`
+
+This is still heuristic-based. If a sender produces unusual move-only job files, you may want to turn this off.
+
 ### Upload-and-run mode
 
 If you want automatic start later, set:
@@ -226,6 +253,10 @@ Important settings include:
 - `protocol_type`: currently `http`
 - `http.spool.start_after_upload`: upload only vs auto-run
 - `http.spool.upload_format`: `gc`, `gc_gz`, or `both`
+- `http.spool.frame_live_passthrough`: live-pass short move-only sequences such as framing
+- `http.spool.frame_idle_seconds`: idle delay before a move-only sequence is treated as live framing
+- `http.spool.zero_power_frame_passthrough`: allow `S0` frame-style job blocks to run live instead of uploading
+- `http.spool.synthetic_motion_status_seconds`: temporary `Run` status duration after live motion commands
 - `http.spool.convert_m4_to_m3`: `false` to preserve dynamic mode, `true` to force `M3`
 - `http.spool.filename_prefix`: file name prefix
 - `http.spool.filename_mode`: `short_counter` or `timestamp_counter`
