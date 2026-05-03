@@ -1,345 +1,65 @@
 # Ray5 LightBurn Bridge
 
-Ray5 LightBurn Bridge is a Python utility that lets LightBurn talk to a Longer Ray5 over Wi-Fi as if it were a normal GRBL `Ethernet/TCP` laser.
+This bridge connects LightBurn to a Longer Ray5 over network APIs and is intended for an upload-to-Ray5 workflow.
 
-It was built for Ray5 machines that expose HTTP and WebSocket services through the onboard ESP32 interface, but do not behave like a plain raw GRBL TCP controller. The bridge sits between LightBurn and the laser, translates network traffic, and makes the Ray5 much easier to use from LightBurn's standard GRBL network mode.
+## What This Bridge Does
 
-## Current status
+- Accepts LightBurn GRBL-style connection on a local TCP port.
+- Translates supported live commands (status, homing, basic jog/console moves) to Ray5 network endpoints.
+- Buffers full job streams and uploads them to Ray5 storage/SD workflow.
+- Keeps GRBL-compatible status responses for LightBurn polling.
 
-The project now supports two practical workflows:
+## Intended Workflow (Recommended)
 
-- live LightBurn control over a local GRBL `Ethernet/TCP` bridge
-- upload-only SD spool mode that creates Ray5 touchscreen-friendly offline job files
+1. Create your job in LightBurn.
+2. Send/start the job through this bridge so it uploads to the Ray5.
+3. On the Ray5 touchscreen, select the uploaded file.
+4. Use the Ray5 touchscreen Frame function.
+5. Run the job from the Ray5 touchscreen.
 
-The most useful proven workflow so far is upload-only mode. LightBurn sends the job to the bridge, the bridge uploads it to the Ray5 over Wi-Fi, and the file can then be selected from the Ray5 screen for border/frame and manual run.
+## Important Limitation
 
-## Why this exists
+WARNING: LightBurn PC Frame is not supported in upload-to-Ray5 mode. Use the Ray5 touchscreen Frame function after uploading the file.
 
-Longer LaserBurn can connect to the Ray5 over Wi-Fi, but LightBurn and LaserGRBL usually expect a more standard GRBL-over-network controller. This project bridges that gap by adapting LightBurn's raw TCP expectations to the Ray5's actual HTTP-based interface.
+This bridge is not a full live USB-GRBL replacement.
 
-## What the bridge does
+- Console/jog/homing may work depending on controller state.
+- Production jobs should use upload plus touchscreen frame/run.
 
-- accepts LightBurn connections as a GRBL `Ethernet/TCP` device
-- forwards GRBL commands to the Ray5 HTTP interface
-- normalizes Ray5 responses into GRBL-style text such as `ok`, `error:`, and status lines
-- handles frequent LightBurn `?` polling safely
-- includes a probe tool for Ray5 service discovery
-- includes an SD spool mode for uploading jobs instead of live-streaming every line
-- supports upload-only mode or upload-and-run mode
+## Setup
 
-## Ray5 behavior observed
-
-The tested Ray5 exposed:
-
-- HTTP command endpoint on port `8848`
-- WebSocket service on port `8849`
-- file upload endpoint for SD-style jobs
-- file listing endpoint
-- SD run command using `$sd/runzip=/filename.gc.gz`
-
-Observed command format:
-
-```text
-GET /command?commandText=<urlencoded gcode>
-```
-
-Observed upload format:
-
-```text
-POST /upload?path=/
-multipart/form-data
-```
-
-Observed compressed run command:
-
-```text
-$sd/runzip=/filename.gc.gz
-```
-
-## Important compatibility finding
-
-The Ray5 touchscreen file browser appears to care a lot about the uploaded base filename.
-
-Long timestamped names like:
-
-```text
-longer__20260430_175659_001.gc.gz
-```
-
-did not reliably appear on the machine screen.
-
-Short LaserBurn-style names like:
-
-```text
-longer_001.gcod
-```
-
-did appear and were selectable from the Ray5 screen.
-
-Because of that, the default spool filename mode now uses short counter-based names instead of long timestamped names.
-
-## Current default offline settings
-
-The default config is now aimed at Ray5 touchscreen selection:
-
-- `http.spool.enabled: true`
-- `http.spool.start_after_upload: false`
-- `http.spool.upload_format: gc`
-- `http.spool.plain_extension: .gcod`
-- `http.spool.screen_compatible_rewrite: true`
-- `http.spool.convert_m4_to_m3: false`
-- `http.spool.filename_prefix: longer`
-- `http.spool.filename_mode: short_counter`
-
-That means new offline uploads look like:
-
-```text
-longer_001.gcod
-longer_002.gcod
-```
-
-## LightBurn setup
-
-Use these settings in LightBurn:
-
-- Device: `GRBL`
-- Connection: `Ethernet/TCP`
-- Address: `127.0.0.1`
-- Port: `9000`
-
-If LightBurn is running on a different machine than the bridge, use the bridge computer's LAN IP instead of `127.0.0.1`.
-
-## Running the bridge
-
-```powershell
-python .\ray5_lightburn_bridge.py --config .\config.json
-```
-
-## How to use
-
-### Recommended upload-only workflow
-
-This is the most proven workflow right now.
-
-1. Insert the SD card into the Ray5.
-2. Power on the Ray5 and make sure it is not in `Alarm`.
-3. Home the machine if needed.
+1. Install Python 3.10+.
+2. Install dependencies:
+   - `pip install requests websockets`
+3. Create a local config from template values (do not commit real machine values):
+   - `RAY5_HOST=192.168.x.x`
+   - `BRIDGE_PORT=9000`
 4. Start the bridge:
+   - `python ray5_lightburn_bridge.py --config config.json`
+5. In LightBurn, add/connect a GRBL device to:
+   - Host: `127.0.0.1`
+   - Port: `9000`
 
-```powershell
-python .\ray5_lightburn_bridge.py --config .\config.json
-```
+## Debug Logging
 
-5. In LightBurn, connect as a `GRBL` `Ethernet/TCP` device at `127.0.0.1:9000`.
-6. Send the job from LightBurn.
-7. Wait for the bridge to finish uploading the file to the Ray5 SD card.
-8. Walk to the Ray5 touchscreen.
-9. Select the uploaded file, usually something like `longer_001.gcod`.
-10. Use `Border` on the Ray5 screen.
-11. Start the job from the Ray5 screen when you are ready.
+Default mode is quiet.
 
-### What success looks like
+- Enable verbose protocol logging via env var:
+  - `DEBUG_PROTOCOL=true`
+- Or in config:
+  - `http.debug_protocol=true`
 
-- LightBurn connects without GRBL startup errors.
-- Upload finishes without `Alarm` or HTTP upload errors.
-- The Ray5 touchscreen shows the uploaded `longer_###.gcod` file.
-- `Border` works from the Ray5 screen.
-- `Print` runs from the Ray5 screen.
+When enabled, raw protocol traffic is written to `lightburn_bridge_protocol.log`.
 
-### If it does not work
+## Troubleshooting
 
-- If the Ray5 shows `Alarm`, clear the alarm and home/unlock the machine before uploading.
-- If uploads fail, confirm the SD card is inserted.
-- If `Border` fails but `Print` works, make sure `http.spool.upload_format` is `gc`, `http.spool.plain_extension` is `.gcod`, and `http.spool.screen_compatible_rewrite` is `true`.
-- After changing `config.json`, restart the bridge before testing again.
+- If LightBurn connects but jobs do not run, verify Ray5 IP/ports and websocket sideband connectivity.
+- If status seems stale, confirm the bridge is receiving sideband status updates.
+- If upload fails, check Ray5 storage availability and upload endpoint settings.
+- If framing seems wrong, use Ray5 touchscreen Frame before running.
 
-## First-time configuration
+## Privacy / Safety
 
-The bundled `config.json` uses safe generic example values. Before using the bridge on a real machine, update these fields for your own network:
-
-- `ray5_host`
-  - set this to your Ray5's IP address
-- `websocket.url`
-  - usually `ws://YOUR_RAY5_IP:8849/ws`
-- `http.url`
-  - usually `http://YOUR_RAY5_IP:8848/command`
-- `http.spool.upload_url`
-  - usually `http://YOUR_RAY5_IP:8848/upload`
-- `http.spool.files_url`
-  - usually `http://YOUR_RAY5_IP:8848/files`
-
-You may also want to adjust these local bridge settings:
-
-- `listen_host`
-  - use `127.0.0.1` if LightBurn runs on the same computer as the bridge
-  - use your bridge computer's LAN IP if LightBurn runs on a different machine
-- `listen_port`
-  - default is `9000`
-  - change it only if that port conflicts with something else on your system
-
-### Example
-
-If your Ray5 is at `192.168.1.77`, the important config values would look like:
-
-```json
-{
-  "ray5_host": "192.168.1.77",
-  "listen_host": "127.0.0.1",
-  "listen_port": 9000,
-  "websocket": {
-    "url": "ws://192.168.1.77:8849/ws"
-  },
-  "http": {
-    "url": "http://192.168.1.77:8848/command",
-    "spool": {
-      "upload_url": "http://192.168.1.77:8848/upload",
-      "files_url": "http://192.168.1.77:8848/files"
-    }
-  }
-}
-```
-
-After that, point LightBurn at:
-
-- Address: `127.0.0.1`
-- Port: `9000`
-
-If LightBurn is on another computer, use the bridge computer's LAN IP instead of `127.0.0.1`.
-
-## How spool mode works
-
-Instead of streaming every command live, spool mode can:
-
-1. buffer likely job lines from LightBurn
-2. wait for a short idle gap
-3. rewrite the job into a more Ray5/LaserBurn-friendly offline format
-4. upload the file to the Ray5
-5. either leave it on SD for manual selection or start it automatically
-
-### Upload-only mode
-
-This is the default mode now.
-
-It is intended for the workflow:
-
-1. send from LightBurn
-2. walk to the Ray5
-3. select the file on the touchscreen
-4. frame/border
-5. run manually
-
-### LightBurn frame buttons
-
-The bridge now has a live frame/jog passthrough path for short motion-only sequences that do not contain laser-on commands.
-
-This is meant to help LightBurn features like:
-
-- Frame
-- simple motion previews
-- move-only outline passes without a laser-on command
-
-Relevant config options:
-
-- `http.spool.frame_live_passthrough`
-  - `true` enables live pass-through for short move-only sequences
-  - `false` disables it and leaves all such traffic in the normal spool logic
-- `http.spool.frame_idle_seconds`
-  - how long the bridge waits before treating a short move-only burst as a live frame/jog sequence
-  - default is `0.35`
-- `http.spool.zero_power_frame_passthrough`
-  - `true` lets job-shaped sequences pass live if they contain no positive `S` power values
-  - this helps when LightBurn frames with `M4` present but `S0`
-- `http.spool.synthetic_motion_status_seconds`
-  - how long the bridge should report a temporary synthetic `Run` state after live motion-style commands
-  - default is `2.0`
-
-This is still heuristic-based. If a sender produces unusual move-only job files, you may want to turn this off.
-
-### Upload-and-run mode
-
-If you want automatic start later, set:
-
-```json
-"start_after_upload": true
-```
-
-## Screen-compatible rewrite
-
-For Ray5 touchscreen compatibility, the bridge rewrites uploaded offline jobs to look more like Longer LaserBurn output.
-
-This currently includes:
-
-- Longer-style comment header
-- absolute-coordinate conversion for mixed `G90`/`G91` streamed jobs
-- optional `M4` to `M3` conversion
-- removal of `M8`
-- LaserBurn-style footer order
-- short Ray5-friendly filenames
-
-By default, `M4` is now preserved so the Ray5 can keep using dynamic laser mode in offline files. If you want the older compatibility behavior, set:
-
-```json
-"convert_m4_to_m3": true
-```
-
-## Configuration notes
-
-Important settings include:
-
-- `ray5_host`: Ray5 IP address
-- `ray5_port`: usually `8848`
-- `listen_host`: usually `127.0.0.1`
-- `listen_port`: usually `9000`
-- `protocol_type`: currently `http`
-- `http.spool.start_after_upload`: upload only vs auto-run
-- `http.spool.upload_format`: `gc`, `gc_gz`, or `both`
-- `http.spool.frame_live_passthrough`: live-pass short move-only sequences such as framing
-- `http.spool.frame_idle_seconds`: idle delay before a move-only sequence is treated as live framing
-- `http.spool.zero_power_frame_passthrough`: allow `S0` frame-style job blocks to run live instead of uploading
-- `http.spool.synthetic_motion_status_seconds`: temporary `Run` status duration after live motion commands
-- `http.spool.convert_m4_to_m3`: `false` to preserve dynamic mode, `true` to force `M3`
-- `http.spool.filename_prefix`: file name prefix
-- `http.spool.filename_mode`: `short_counter` or `timestamp_counter`
-
-### Upload format guidance
-
-- `gc`: current best match for Ray5 touchscreen offline workflow when combined with `plain_extension: ".gcod"` and `screen_compatible_rewrite: true`
-- `gc_gz`: may still be useful on some firmware versions, especially for web-started compressed playback
-- `both`: uploads both variants if you want to compare behaviors on your own machine
-
-## Project files
-
-- `ray5_probe.py`
-  - scans likely Ray5 ports and records safe probe results
-- `ray5_lightburn_bridge.py`
-  - main LightBurn bridge
-- `config.json`
-  - IP, ports, bridge mode, and spool settings
-- `capture_notes.md`
-  - notes from protocol discovery and traffic capture
-- `ray5_probe_report.json`
-  - example probe output
-- `bridge.log`
-  - runtime bridge log
-
-## Safe discovery notes
-
-Only safe discovery commands were used during protocol testing:
-
-- `?`
-- `$$`
-- `$I`
-- `$G`
-
-No laser power or movement test commands were intentionally used during initial protocol discovery without approval.
-
-## Known limitations
-
-- LightBurn expects live GRBL behavior, so some status values are synthetic
-- Ray5 HTTP responses are not always identical to a normal GRBL TCP controller
-- upload-and-run mode is still less battle-tested than upload-only mode
-- the Ray5 touchscreen appears to be picky about offline file naming and formatting
-
-## License
-
-MIT
+- Do not commit logs, IP addresses, local settings, or machine-specific config.
+- Keep laser power low during validation.
+- Always verify frame and origin on the Ray5 touchscreen before running.

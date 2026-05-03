@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import gzip
 import json
 import logging
@@ -16,12 +17,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 
 REALTIME_BYTES = {b"?", b"!", b"~", b"\x18"}
 TERMINAL_PREFIXES = ("ok", "error", "alarm")
 STATUS_PREFIXES = ("<", "[")
+PROTOCOL_LOGGER_NAME = "bridge.protocol"
+MOTION_CANDIDATE_PREFIXES = ("G0", "G1", "G2", "G3", "$J=", "M3", "M4", "M5")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -29,6 +33,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def configure_logging(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -37,6 +42,121 @@ def configure_logging(log_path: Path) -> None:
             logging.StreamHandler(),
         ],
     )
+
+
+def configure_protocol_logging(protocol_log_path: Path, enabled: bool) -> None:
+    if not enabled:
+        return
+    protocol_log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(PROTOCOL_LOGGER_NAME)
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter(
+        fmt="%(asctime)s.%(msecs)03d %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    for handler in (
+        logging.FileHandler(protocol_log_path, encoding="utf-8"),
+        logging.StreamHandler(),
+    ):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+
+def resolve_log_path(config_path: Path, config: dict[str, Any]) -> Path:
+    configured_log_file = Path(str(config.get("log_file", "bridge.log")).strip() or "bridge.log")
+    configured_log_dir = Path(str(config.get("log_dir", "logs")).strip() or "logs")
+    if not configured_log_dir.is_absolute():
+        configured_log_dir = config_path.parent / configured_log_dir
+    prefix = str(config.get("log_prefix", configured_log_file.stem or "bridge")).strip() or "bridge"
+    suffix = configured_log_file.suffix or ".log"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return configured_log_dir / f"{prefix}_{timestamp}{suffix}"
+
+
+def prune_old_logs(log_dir: Path, retention_days: float) -> int:
+    cutoff = time.time() - max(retention_days, 0.0) * 86400.0
+    deleted = 0
+    for candidate in log_dir.glob("*.log"):
+        try:
+            if candidate.is_file() and candidate.stat().st_mtime < cutoff:
+                candidate.unlink()
+                deleted += 1
+        except OSError:
+            logging.warning("Failed to delete old log %s", candidate, exc_info=True)
+    return deleted
+
+
+def resolve_protocol_log_path(config_path: Path) -> Path:
+    return config_path.parent / "lightburn_bridge_protocol.log"
+
+
+def _visible_text(text: str) -> str:
+    parts: list[str] = []
+    for char in text:
+        if char == "\\":
+            parts.append("\\\\")
+        elif char == "\r":
+            parts.append("\\r")
+        elif char == "\n":
+            parts.append("\\n")
+        elif char == "\t":
+            parts.append("\\t")
+        else:
+            codepoint = ord(char)
+            if 32 <= codepoint <= 126:
+                parts.append(char)
+            else:
+                parts.append(f"\\x{codepoint:02x}")
+    return "".join(parts)
+
+
+def _visible_bytes(payload: bytes) -> str:
+    return _visible_text(payload.decode("latin-1"))
+
+
+def log_protocol(direction: str, payload: bytes | str) -> None:
+    logger = logging.getLogger(PROTOCOL_LOGGER_NAME)
+    if not logger.handlers:
+        return
+    rendered = _visible_bytes(payload) if isinstance(payload, (bytes, bytearray)) else _visible_text(payload)
+    logger.info("%s %s", direction, rendered)
+
+
+def _is_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _format_http_request(prepared: requests.PreparedRequest) -> str:
+    parsed = urlsplit(prepared.url or "")
+    target = parsed.path or "/"
+    if parsed.query:
+        target += f"?{parsed.query}"
+    lines = [f"{prepared.method or 'GET'} {target} HTTP/1.1"]
+    host = parsed.netloc
+    header_names = {name.lower() for name in prepared.headers.keys()}
+    if host and "host" not in header_names:
+        lines.append(f"Host: {host}")
+    for name, value in prepared.headers.items():
+        lines.append(f"{name}: {value}")
+    lines.append("")
+    body = prepared.body
+    if body is None:
+        return "\r\n".join(lines) + "\r\n"
+    body_text = body.decode("latin-1") if isinstance(body, bytes) else str(body)
+    return "\r\n".join(lines) + "\r\n" + body_text
+
+
+def _format_http_response(response: requests.Response) -> str:
+    reason = response.reason or ""
+    lines = [f"HTTP/1.1 {response.status_code} {reason}".rstrip()]
+    for name, value in response.headers.items():
+        lines.append(f"{name}: {value}")
+    lines.append("")
+    return "\r\n".join(lines) + "\r\n" + response.text
 
 
 class BridgeProtocolError(RuntimeError):
@@ -144,12 +264,14 @@ class TcpUpstream(UpstreamBase):
             raise BridgeProtocolError("TCP upstream is not connected.")
         payload = (line + self.newline).encode("utf-8")
         self.log.info("TX line %r", line)
+        log_protocol("BRIDGE -> RAY5", payload)
         self.sock.sendall(payload)
 
     def send_realtime(self, raw: bytes) -> None:
         if self.sock is None:
             raise BridgeProtocolError("TCP upstream is not connected.")
         self.log.info("TX realtime %r", raw)
+        log_protocol("BRIDGE -> RAY5", raw)
         self.sock.sendall(raw)
 
     def _reader_loop(self) -> None:
@@ -163,6 +285,7 @@ class TcpUpstream(UpstreamBase):
                 break
             if not data:
                 break
+            log_protocol("RAY5 -> BRIDGE", data)
             self.handler.forward_upstream_data(data)
         self.handler.on_upstream_closed()
 
@@ -206,6 +329,7 @@ class WebSocketUpstream(UpstreamBase):
         if ws_config.get("append_newline"):
             outbound += self.newline
         self.log.info("TX line %r", line)
+        log_protocol("BRIDGE -> RAY5", outbound)
         self.ws.send(outbound)
 
     def send_realtime(self, raw: bytes) -> None:
@@ -213,6 +337,7 @@ class WebSocketUpstream(UpstreamBase):
             raise BridgeProtocolError("WebSocket upstream is not connected.")
         text = raw.decode("latin-1")
         self.log.info("TX realtime %r", raw)
+        log_protocol("BRIDGE -> RAY5", text)
         self.ws.send(text)
 
     def _reader_loop(self) -> None:
@@ -230,6 +355,7 @@ class WebSocketUpstream(UpstreamBase):
                 payload = data.encode("utf-8", errors="replace")
             else:
                 payload = data
+            log_protocol("RAY5 -> BRIDGE", payload)
             self.handler.forward_upstream_data(payload)
         self.handler.on_upstream_closed()
 
@@ -268,14 +394,20 @@ class HttpUpstream(UpstreamBase):
         self._coordinate_system = "G54"
         self._last_controller_state = "UNKNOWN"
         self._last_real_status_query_at = 0.0
+        self._last_status_update_at = 0.0
         self._last_sd_status_value: str | None = None
         self._manual_sd_run_passive = False
+        self._interactive_live_until = 0.0
         self._sideband_ws = None
         self._sideband_thread: threading.Thread | None = None
         self._sideband_stop = threading.Event()
         self._sideband_lines: queue.Queue[str] = queue.Queue()
         self._sideband_page_id = ""
         self._sideband_active_id = ""
+        self._cached_status_line: str | None = None
+        self._cached_status_updated_at = 0.0
+        self.dual_mode_config = self.http_config.get("dual_mode", {})
+        self._mode_selected = "LIVE"
 
     def classify_command(self, command: str) -> str:
         stripped = command.strip()
@@ -287,6 +419,14 @@ class HttpUpstream(UpstreamBase):
             return "settings"
         if stripped.startswith("[") or stripped.startswith("<"):
             return "status_payload"
+        if self._is_job_header_line(stripped):
+            return "spool_job_header"
+        if self._spool_enabled:
+            with self._spool_lock:
+                if self._spool_job_started:
+                    return "spool_job"
+        if self._should_immediate_live_passthrough(stripped):
+            return "live_passthrough"
         if self._looks_like_live_motion_command(stripped):
             return "live_motion_candidate"
         if self._spool_enabled and self._should_spool_command(stripped):
@@ -315,7 +455,7 @@ class HttpUpstream(UpstreamBase):
             self.handler.forward_upstream_data(response_text.encode("utf-8"))
             self.handler.complete_current_command()
             return
-        synthetic_response = None if self._sideband_available() else self._synthetic_grbl_response(line)
+        synthetic_response = self._synthetic_grbl_response(line) if self._prefer_synthetic_grbl_response(line) else None
         if synthetic_response is not None:
             self.log.info("TX synthetic GRBL response for %r", line)
             self.handler.forward_upstream_data(synthetic_response.encode("utf-8"))
@@ -336,7 +476,7 @@ class HttpUpstream(UpstreamBase):
             self._reset_virtual_state()
             self._send_startup_banner()
             return
-        synthetic_response = None if self._sideband_available() else self._synthetic_grbl_response(command)
+        synthetic_response = self._synthetic_grbl_response(command) if self._prefer_synthetic_grbl_response(command) else None
         if synthetic_response is not None:
             self.log.info("TX synthetic GRBL realtime response for %r", command)
             self.handler.forward_upstream_data(synthetic_response.encode("utf-8"))
@@ -344,16 +484,31 @@ class HttpUpstream(UpstreamBase):
         response_text = self._issue_http_command(command)
         self.handler.forward_upstream_data(response_text.encode("utf-8"))
 
+    def _prefer_synthetic_grbl_response(self, command: str) -> bool:
+        if not self.http_config.get("synthetic_grbl_handshake", True):
+            return not self._sideband_available()
+        upper = command.strip().upper()
+        if upper in {"$I", "$$", "$#", "$G"}:
+            return True
+        if self._is_modal_probe_command(upper):
+            return True
+        return not self._sideband_available()
+
+    def _is_modal_probe_command(self, command: str) -> bool:
+        compact = self._compact_gcode_spacing(command).upper()
+        return compact in {"G0", "G00", "G1", "G01"}
+
     def _issue_status_query(self) -> str:
-        synthetic_reason = self._synthetic_status_query_reason()
-        if synthetic_reason is not None:
-            status_line = self._build_status_line()
-            self.log.debug("Using synthetic status for '?' while %s", synthetic_reason)
-            return status_line + "\n"
-        response_text = self._issue_http_command("?")
+        started_at = time.perf_counter()
         with self._spool_lock:
-            self._last_real_status_query_at = time.time()
-        return response_text
+            status_line = self._cached_status_line
+        if status_line:
+            self.log.debug("STATUS CACHE HIT")
+        else:
+            status_line = "<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000|WCO:0.000,0.000,0.000|FS:0,0>"
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        self.log.debug("STATUS RESPONSE TIME MS %.3f", elapsed_ms)
+        return status_line + "\n"
 
     def _ensure_manual_sd_run_ready_for_command(self, command: str) -> bool:
         classification = self.classify_command(command)
@@ -415,9 +570,22 @@ class HttpUpstream(UpstreamBase):
                 poll_interval = max(0.1, float(self.spool_config.get("sd_status_query_interval_seconds", 5.0)))
                 if time.time() - self._last_real_status_query_at < poll_interval:
                     return "SD job is active (throttling controller status polls)"
+            prefer_cached = bool(self.http_config.get("prefer_cached_status_queries", True)) and not self._sideband_available()
+            cached_interval = max(
+                0.1,
+                float(self.http_config.get("cached_status_query_interval_seconds", 30.0)),
+            )
+            controller_state = self._last_controller_state
+            last_status_update_at = self._last_status_update_at
+        if prefer_cached and controller_state != "UNKNOWN":
+            if last_status_update_at <= 0.0 or (time.time() - last_status_update_at) <= cached_interval:
+                return "cached controller status is available"
         return None
 
     def _issue_http_command(self, command: str) -> str:
+        if command.strip() == "?":
+            # Never proxy status polls through the Ray5 HTTP command endpoint.
+            return self._issue_status_query()
         with self._command_exchange_lock:
             method = self.http_config.get("method", "GET").upper()
             url = self.http_config["url"]
@@ -459,20 +627,26 @@ class HttpUpstream(UpstreamBase):
             stale_sideband_lines = self._drain_sideband_lines()
             if stale_sideband_lines:
                 self.log.debug("Discarded stale websocket sideband lines before %r: %r", command, stale_sideband_lines)
+            request = requests.Request(
+                method=method,
+                url=url,
+                headers=headers,
+                params=params,
+                data=data,
+                json=json_payload,
+            )
+            prepared = self.session.prepare_request(request)
+            log_protocol("BRIDGE -> RAY5", _format_http_request(prepared))
             try:
-                response = self.session.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    data=data,
-                    json=json_payload,
+                response = self.session.send(
+                    prepared,
                     timeout=self.connect_timeout,
                 )
             except requests.RequestException as exc:
                 raise BridgeProtocolError(f"http request failed: {exc}") from exc
 
             if not response.ok:
+                log_protocol("RAY5 -> BRIDGE", _format_http_response(response))
                 text = response.text.strip() or response.reason or f"HTTP {response.status_code}"
                 return f"error: ray5 http {response.status_code}: {text}\n"
 
@@ -489,8 +663,9 @@ class HttpUpstream(UpstreamBase):
                 text,
                 command,
             )
+            log_protocol("RAY5 -> BRIDGE", _format_http_response(response))
             ws_lines = self._collect_sideband_response(command)
-            if ws_lines:
+            if command.startswith("?") and ws_lines:
                 lines = self._normalize_sideband_lines(ws_lines)
                 self.log.info("RX websocket sideband lines for %r: %r", command, lines)
             elif command.startswith("?"):
@@ -498,7 +673,31 @@ class HttpUpstream(UpstreamBase):
                 self.log.debug("Falling back to synthetic status for '?' because websocket produced no status line")
                 lines = [status_line]
             else:
+                # Keep non-status command responses strictly tied to the direct
+                # HTTP command exchange to avoid replaying stale sideband 'ok'.
                 lines = self._normalize_http_response(command, text)
+                if ws_lines:
+                    normalized_sideband = self._normalize_sideband_lines(ws_lines)
+                    self.log.info(
+                        "Observed websocket sideband lines during %r (not used as terminal response): %r",
+                        command,
+                        normalized_sideband,
+                    )
+                    for sideband_line in normalized_sideband:
+                        if sideband_line.startswith("<"):
+                            self._apply_status_line(sideband_line)
+                lines = self._sanitize_non_status_response_lines(command, lines)
+
+            lines = self._filter_invalid_response_lines(lines)
+            if command.startswith("?"):
+                status_lines = [line for line in lines if line.startswith("<") and line.endswith(">")]
+                if not status_lines:
+                    status_lines = [self._build_status_line()]
+                lines = [status_lines[0]]
+            else:
+                has_terminal = any(line.lower().startswith(TERMINAL_PREFIXES) for line in lines)
+                if not has_terminal:
+                    lines.append("ok")
 
             self._apply_status_lines(lines)
             if self._response_indicates_success(lines):
@@ -506,6 +705,62 @@ class HttpUpstream(UpstreamBase):
             if self._response_indicates_success(lines) and self._should_mark_synthetic_motion(command):
                 self._mark_synthetic_motion(command)
             return "\n".join(lines) + "\n"
+
+    def _sanitize_non_status_response_lines(self, command: str, lines: list[str]) -> list[str]:
+        if command.strip().startswith("?"):
+            return lines
+        cleaned: list[str] = []
+        terminal_line: str | None = None
+        extra_terminals: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lowered = stripped.lower()
+            if lowered.startswith(TERMINAL_PREFIXES):
+                if terminal_line is None:
+                    terminal_line = stripped
+                else:
+                    extra_terminals.append(stripped)
+                continue
+            cleaned.append(stripped)
+
+        if terminal_line is None:
+            terminal_line = "ok"
+        if extra_terminals:
+            self.log.warning(
+                "Dropped extra terminal response lines for %r to preserve one-response sync: %r",
+                command,
+                extra_terminals,
+            )
+        cleaned.append(terminal_line)
+        return cleaned
+
+    def _filter_invalid_response_lines(self, lines: list[str]) -> list[str]:
+        filtered: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+            if lower == "ok":
+                filtered.append("ok")
+                continue
+            if re.fullmatch(r"error:\d+", lower):
+                filtered.append(lower)
+                continue
+            if stripped.startswith("<") and stripped.endswith(">"):
+                filtered.append(stripped)
+                continue
+            if stripped.startswith("[") and stripped.endswith("]"):
+                filtered.append(stripped)
+                continue
+            if lower == "error":
+                filtered.append("error:1")
+                self.log.warning("FILTERED INVALID RESPONSE: %s", stripped)
+                continue
+            self.log.warning("FILTERED INVALID RESPONSE: %s", stripped)
+        return filtered
 
     def _sideband_available(self) -> bool:
         return self._sideband_ws is not None
@@ -558,10 +813,12 @@ class HttpUpstream(UpstreamBase):
                 break
 
             if isinstance(payload, str):
+                log_protocol("RAY5 -> BRIDGE", payload)
                 if self._process_sideband_control_message(payload):
                     continue
                 chunk = payload
             else:
+                log_protocol("RAY5 -> BRIDGE", payload)
                 chunk = payload.decode("utf-8", errors="replace")
 
             for line in normalizer.feed(chunk):
@@ -704,8 +961,12 @@ class HttpUpstream(UpstreamBase):
             stripped = line.strip()
             if not stripped:
                 continue
-            if stripped.startswith(",") and merged_lines and merged_lines[-1].startswith("[OPT:"):
-                merged_lines[-1] = merged_lines[-1][:-1] + stripped
+            if stripped.startswith(",") and stripped.endswith("]"):
+                opt_index = next((idx for idx in range(len(merged_lines) - 1, -1, -1) if merged_lines[idx].startswith("[OPT:")), None)
+                if opt_index is not None:
+                    merged_lines[opt_index] = merged_lines[opt_index][:-1] + stripped
+                    continue
+                self.log.debug("Dropping unmatched websocket continuation line %r", stripped)
                 continue
             merged_lines.append(stripped)
 
@@ -766,11 +1027,8 @@ class HttpUpstream(UpstreamBase):
         raw_wco: list[float] | None = None
         raw_feed: float | None = None
         raw_power: float | None = None
-        extras: list[str] = []
-
         for field in fields[1:]:
             if ":" not in field:
-                extras.append(field)
                 continue
 
             key, raw_value = field.split(":", 1)
@@ -798,9 +1056,11 @@ class HttpUpstream(UpstreamBase):
                     if len(fs_values) > 1:
                         raw_power = fs_values[1]
                 continue
-            if key == "HEAP":
+            # Keep the status shape deterministic for LightBurn by forwarding
+            # only the core GRBL fields it needs for motion/state tracking.
+            if key in {"HEAP", "OV", "PN", "BFS", "BUF", "LINE", "SD", "MSG"}:
                 continue
-            extras.append(field)
+            continue
 
         with self._spool_lock:
             mpos = list(self._virtual_mpos)
@@ -833,14 +1093,6 @@ class HttpUpstream(UpstreamBase):
             f"FS:{feed:.0f},{power:.0f}",
         ]
 
-        seen_extras: set[str] = set()
-        for extra in extras:
-            normalized_extra = extra.strip()
-            if not normalized_extra or normalized_extra in seen_extras:
-                continue
-            seen_extras.add(normalized_extra)
-            normalized_fields.append(normalized_extra)
-
         return "<" + "|".join(normalized_fields) + ">"
 
     def _handle_spooled_line(self, line: str) -> bool:
@@ -856,18 +1108,34 @@ class HttpUpstream(UpstreamBase):
         if self._is_passthrough_command(stripped):
             return False
 
-        synthetic_response = None if self._sideband_available() else self._synthetic_grbl_response(stripped)
+        synthetic_response = self._synthetic_grbl_response(stripped) if self._prefer_synthetic_grbl_response(stripped) else None
         if synthetic_response is not None:
             self.log.info("TX synthetic GRBL response for %r", stripped)
             self.handler.forward_upstream_data(synthetic_response.encode("utf-8"))
             return True
 
-        frame_live_passthrough = bool(self.spool_config.get("frame_live_passthrough", True))
-        allow_zero_power_frame = bool(self.spool_config.get("zero_power_frame_passthrough", True))
-        run_live_now = False
-        live_lines: list[str] = []
+        if self._is_live_motion_passthrough_command(stripped) and not self._upload_mode_active():
+            self._mode_selected = "LIVE"
+            self.log.info("MODE SELECTED: LIVE")
+            self.log.info("LIVE PASSTHROUGH COMMAND line=%r", stripped)
+            response_text = self._issue_http_command(stripped)
+            self.handler.forward_upstream_data(response_text.encode("utf-8"))
+            return True
+
+        if self._should_immediate_live_passthrough(stripped):
+            self._mode_selected = "LIVE"
+            self.log.info("MODE SELECTED: LIVE")
+            self.log.info("LIVE PASSTHROUGH COMMAND line=%r", stripped)
+            self.log.info("TX HTTP immediate live passthrough line %r", stripped)
+            response_text = self._issue_http_command(stripped)
+            self.handler.forward_upstream_data(response_text.encode("utf-8"))
+            self._mark_interactive_live_line(stripped)
+            return True
 
         if not self._should_spool_command(stripped):
+            self._mode_selected = "LIVE"
+            self.log.info("MODE SELECTED: LIVE")
+            self.log.info("LIVE PASSTHROUGH COMMAND line=%r", stripped)
             self.log.info("TX HTTP passthrough non-job line %r", stripped)
             response_text = self._issue_http_command(stripped)
             self.handler.forward_upstream_data(response_text.encode("utf-8"))
@@ -875,41 +1143,19 @@ class HttpUpstream(UpstreamBase):
 
         with self._spool_lock:
             if not self._spool_job_started:
+                self._mode_selected = "UPLOAD"
+                self.log.info("MODE SELECTED: UPLOAD")
                 self._spool_job_started = True
                 self._spool_started_at = time.time()
                 self._spool_lines = []
                 self._spool_has_job_marker = False
+                self._interactive_live_until = 0.0
             self._spool_last_line_at = time.time()
             self._spool_lines.append(stripped)
             self._spool_has_job_marker = self._spool_has_job_marker or self._is_job_marker_command(stripped)
             job_line_count = len(self._spool_lines)
             self._ensure_spool_monitor_locked()
-            if (
-                frame_live_passthrough
-                and stripped.upper() == "M2"
-                and self._is_live_frame_sequence(self._spool_lines, allow_zero_power_frame=allow_zero_power_frame)
-            ):
-                live_lines = list(self._spool_lines)
-                self._spool_job_started = False
-                self._spool_started_at = None
-                self._spool_last_line_at = None
-                self._spool_lines = []
-                self._spool_has_job_marker = False
-                run_live_now = True
-
-        if run_live_now:
-            self.log.info("Running %d buffered lines as live frame/jog sequence immediately on terminal marker", len(live_lines))
-            try:
-                self._run_live_motion_sequence(live_lines)
-            except Exception as exc:
-                self.log.exception("Failed to run immediate live frame/jog sequence")
-                self.handler.forward_upstream_data(f"error: live motion failed: {exc}\n".encode("utf-8"))
-            else:
-                # Hold the terminal M2 acknowledgment until the live sequence actually finishes.
-                self.handler.forward_upstream_data(b"ok\n")
-            return True
-
-        self.log.info("Spool buffered line %r (%d buffered)", stripped, job_line_count)
+        self.log.info("UPLOAD JOB BUFFERED line=%r count=%d", stripped, job_line_count)
         self.handler.forward_upstream_data(b"ok\n")
         return True
 
@@ -921,8 +1167,6 @@ class HttpUpstream(UpstreamBase):
 
     def _spool_monitor_loop(self) -> None:
         idle_seconds = float(self.spool_config.get("idle_seconds", 1.5))
-        frame_idle_seconds = float(self.spool_config.get("frame_idle_seconds", 0.35))
-        frame_live_passthrough = bool(self.spool_config.get("frame_live_passthrough", True))
         while True:
             time.sleep(0.2)
             with self._spool_lock:
@@ -933,8 +1177,7 @@ class HttpUpstream(UpstreamBase):
                 has_job_marker = self._spool_has_job_marker
                 if last_line_at is None:
                     continue
-                effective_idle_seconds = idle_seconds if has_job_marker or not frame_live_passthrough else frame_idle_seconds
-                if time.time() - last_line_at < effective_idle_seconds:
+                if time.time() - last_line_at < idle_seconds:
                     continue
                 self._spool_job_started = False
                 self._spool_started_at = None
@@ -943,17 +1186,7 @@ class HttpUpstream(UpstreamBase):
                 self._spool_has_job_marker = False
                 break
 
-        min_lines = int(self.spool_config.get("minimum_job_lines", 10))
-        allow_zero_power_frame = bool(self.spool_config.get("zero_power_frame_passthrough", True))
-        if frame_live_passthrough and self._is_live_frame_sequence(lines, allow_zero_power_frame=allow_zero_power_frame):
-            self.log.info("Running %d buffered lines as live frame/jog sequence", len(lines))
-            try:
-                self._run_live_motion_sequence(lines)
-            except Exception as exc:
-                self.log.exception("Failed to run live frame/jog sequence")
-                self.handler.forward_upstream_data(f"error: live motion failed: {exc}\n".encode("utf-8"))
-            return
-
+        min_lines = int(self.dual_mode_config.get("upload_minimum_job_lines", self.spool_config.get("minimum_job_lines", 10)))
         if not has_job_marker and len(lines) < min_lines:
             self.log.info("Discarded buffered job with %d lines as likely handshake chatter", len(lines))
             return
@@ -1098,7 +1331,11 @@ class HttpUpstream(UpstreamBase):
 
     def _should_mark_synthetic_motion(self, command: str) -> bool:
         upper = command.strip().upper()
-        return upper.startswith(("G0", "G00", "G1", "G01", "G2", "G02", "G3", "G03", "$H", "G28"))
+        if upper.startswith(("$H", "G28", "G28.2")):
+            return True
+        if not upper.startswith(("G0", "G00", "G1", "G01", "G2", "G02", "G3", "G03")):
+            return False
+        return any(axis in upper for axis in ("X", "Y", "Z", "A", "B", "C", "U", "V", "W"))
 
     def _is_job_marker_command(self, command: str) -> bool:
         upper = command.upper()
@@ -1398,7 +1635,8 @@ class HttpUpstream(UpstreamBase):
                 self._apply_status_line(line)
 
     def _apply_status_line(self, status_line: str) -> None:
-        content = status_line.strip()
+        normalized = self._normalize_sideband_status_line(status_line)
+        content = normalized.strip()
         if not (content.startswith("<") and content.endswith(">")):
             return
         fields = content[1:-1].split("|")
@@ -1433,7 +1671,11 @@ class HttpUpstream(UpstreamBase):
                 sd_value = raw_value
 
         with self._spool_lock:
+            self._cached_status_line = normalized
+            self._cached_status_updated_at = time.time()
             self._last_controller_state = state
+            self._last_status_update_at = time.time()
+            self._synthetic_run_until = None
             if "MPOS" in updates:
                 self._virtual_mpos = self._pad_axis_values(updates["MPOS"], fill_from=self._virtual_mpos)
             if "WCO" in updates:
@@ -1500,7 +1742,7 @@ class HttpUpstream(UpstreamBase):
         return parts[1].lstrip("/")
 
     def _send_startup_banner(self) -> None:
-        banner = self.http_config.get("startup_banner", "Grbl 1.1h ['$' for help]")
+        banner = self.http_config.get("startup_banner", "Grbl 1.1f ['$' for help]")
         self.log.info("TX synthetic startup banner %r", banner)
         self.handler.forward_upstream_data((str(banner) + "\n").encode("utf-8"))
 
@@ -1515,6 +1757,7 @@ class HttpUpstream(UpstreamBase):
             self._laser_mode = "M5"
             self._coordinate_system = "G54"
             self._last_controller_state = "UNKNOWN"
+            self._last_status_update_at = 0.0
             self._synthetic_run_until = None
             self._synthetic_run_message = "moving"
             self._live_motion_active = False
@@ -1524,6 +1767,7 @@ class HttpUpstream(UpstreamBase):
             self._spool_lines = []
             self._spool_has_job_marker = False
             self._manual_sd_run_passive = False
+            self._interactive_live_until = 0.0
             self._clear_spool_job_tracking_locked()
 
     def _clear_spool_job_tracking_locked(self) -> None:
@@ -1534,44 +1778,57 @@ class HttpUpstream(UpstreamBase):
         self._last_sd_status_value = None
         self._manual_sd_run_passive = False
 
+    def _synthetic_limit_value(self, axis: str, default: float) -> float:
+        limits = self.http_config.get("synthetic_limits", {})
+        raw = limits.get(axis, default)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return float(default)
+
     def _synthetic_grbl_response(self, command: str) -> str | None:
         upper = command.strip().upper()
+        if self._is_modal_probe_command(upper):
+            return "ok\n"
         if upper == "$$":
+            limit_x = self._synthetic_limit_value("x", 400.0)
+            limit_y = self._synthetic_limit_value("y", 365.0)
+            limit_z = self._synthetic_limit_value("z", 300.0)
             return "\n".join([
-                "$0=10",
-                "$1=25",
+                "$0=3",
+                "$1=250",
                 "$2=0",
                 "$3=0",
                 "$4=0",
-                "$5=0",
+                "$5=1",
                 "$6=0",
-                "$10=3",
+                "$10=1",
                 "$11=0.010",
                 "$12=0.002",
                 "$13=0",
-                "$20=0",
+                "$20=1",
                 "$21=1",
                 "$22=1",
-                "$23=0",
-                "$24=1000.000",
-                "$25=3000.000",
-                "$26=250",
-                "$27=3.000",
-                "$30=1000",
-                "$31=0",
+                "$23=3",
+                "$24=200.000",
+                "$25=2000.000",
+                "$26=250.000",
+                "$27=2.000",
+                "$30=1000.000",
+                "$31=0.000",
                 "$32=1",
                 "$100=80.000",
                 "$101=80.000",
-                "$102=400.000",
-                "$110=12000.000",
-                "$111=12000.000",
+                "$102=100.000",
+                "$110=24000.000",
+                "$111=24000.000",
                 "$112=1000.000",
-                "$120=400.000",
-                "$121=400.000",
-                "$122=50.000",
-                "$130=400.000",
-                "$131=400.000",
-                "$132=50.000",
+                "$120=500.000",
+                "$121=500.000",
+                "$122=200.000",
+                f"$130={limit_x:.3f}",
+                f"$131={limit_y:.3f}",
+                f"$132={limit_z:.3f}",
                 "ok",
             ]) + "\n"
         if upper == "$#":
@@ -1601,7 +1858,9 @@ class HttpUpstream(UpstreamBase):
                 power = self._current_power
             return f"[GC:G0 {coord} G17 {units} {mode} G94 {laser_mode} M9 T0 F{feed:.3f} S{power:.3f}]\nok\n"
         if upper == "$I":
-            return "[VER:1.1h.2026:Ray5 LightBurn Bridge]\n[OPT:VN,15,128]\nok\n"
+            version_line = str(self.http_config.get("synthetic_grbl_version_line", "[VER:1.1f.20211103:grbl-embedded]"))
+            options_line = str(self.http_config.get("synthetic_grbl_options_line", "[OPT:PHSW,64,256]"))
+            return f"{version_line}\n{options_line}\nok\n"
         return None
 
     def _compact_gcode_spacing(self, line: str) -> str:
@@ -1692,9 +1951,88 @@ class HttpUpstream(UpstreamBase):
             return False
         if command.startswith("[") or command.startswith("<"):
             return False
-        if command in {"G0", "G00", "G1", "G01"}:
+        if self._is_live_motion_passthrough_command(command):
             return False
         return True
+
+    def _is_live_motion_passthrough_command(self, command: str) -> bool:
+        upper = command.strip().upper()
+        if upper.startswith("$J="):
+            return True
+        if upper.startswith(("M3", "M4", "M5")):
+            return True
+        if upper.startswith(("S", "F")):
+            return True
+        if upper.startswith(("G0", "G00", "G1", "G01", "G2", "G02", "G3", "G03")):
+            return any(axis in upper for axis in ("X", "Y", "Z", "I", "J", "K"))
+        return False
+
+    def _upload_mode_active(self) -> bool:
+        with self._spool_lock:
+            return self._spool_job_started
+
+    def _is_job_header_line(self, command: str) -> bool:
+        compact = self._compact_gcode_spacing(command.upper()).replace(" ", "")
+        return compact in {"G00G17G40G21G54", "G0G17G40G21G54"}
+
+    def _interactive_live_window_seconds(self) -> float:
+        return max(0.25, float(self.spool_config.get("interactive_live_window_seconds", 1.0)))
+
+    def _interactive_live_active(self) -> bool:
+        with self._spool_lock:
+            return time.time() < self._interactive_live_until
+
+    def _mark_interactive_live_line(self, command: str) -> None:
+        upper = command.upper().strip()
+        with self._spool_lock:
+            if upper in {"M2"}:
+                self._interactive_live_until = 0.0
+            else:
+                self._interactive_live_until = time.time() + self._interactive_live_window_seconds()
+
+    def _is_immediate_live_control_line(self, command: str) -> bool:
+        upper = command.upper().strip()
+        if self._is_job_header_line(upper):
+            return False
+        return upper.startswith(("G90", "G91", "G20", "G21", "G53", "G54", "G92", "M3", "M4", "M5", "F", "S"))
+
+    def _is_immediate_live_motion_line(self, command: str) -> bool:
+        upper = command.upper().strip()
+        if self._is_job_header_line(upper):
+            return False
+        if not upper.startswith(("G0", "G00", "G1", "G01")):
+            return False
+        if not any(axis in upper for axis in ("X", "Y", "Z")):
+            return False
+        positive_s = self._extract_numeric_token(upper, "S")
+        if positive_s is not None and positive_s > 0 and not self._interactive_live_active():
+            return False
+        return True
+
+    def _is_immediate_live_modal_continuation_line(self, command: str) -> bool:
+        upper = command.upper().strip()
+        if not upper or upper.startswith(("G", "M", "$", "[", "<")):
+            return False
+        if not self._interactive_live_active():
+            return False
+        if not any(axis in upper for axis in ("X", "Y", "Z")):
+            return False
+        return True
+
+    def _should_immediate_live_passthrough(self, command: str) -> bool:
+        if not self._spool_enabled:
+            return False
+        upper = command.upper().strip()
+        with self._spool_lock:
+            if self._spool_job_started:
+                return False
+        if self._is_immediate_live_control_line(upper):
+            return True
+        if upper in {"M2", "M9"} and self._interactive_live_active():
+            return True
+        if self._is_immediate_live_motion_line(upper):
+            return True
+        return self._is_immediate_live_modal_continuation_line(upper)
 
     def _looks_like_live_motion_command(self, command: str) -> bool:
         upper = command.upper().strip()
@@ -1753,6 +2091,12 @@ class BridgeHandler(socketserver.BaseRequestHandler):
         self.client_lock = threading.Lock()
         self.queue: queue.Queue[QueuedCommand] = queue.Queue()
         self.closed = threading.Event()
+        self._command_state_lock = threading.Lock()
+        self._command_in_progress = False
+        self._motion_watch_started_at = time.time()
+        self._motion_candidate_seen = False
+        self._no_motion_logged = False
+        self._frame_warning_logged = False
         self.worker = threading.Thread(target=self._command_worker, daemon=True)
         protocol_type = self.config.get("protocol_type", "tcp")
         self.upstream = UPSTREAM_FACTORIES[protocol_type](self.config, self)
@@ -1782,17 +2126,74 @@ class BridgeHandler(socketserver.BaseRequestHandler):
         self.log.info("Client disconnected")
 
     def _consume_client_bytes(self, data: bytes) -> None:
-        self.log.info("RX client %r", data)
+        self.log.debug("RX client %r", data)
+        log_protocol("LB -> BRIDGE", data)
         for byte_value in data:
             raw = bytes([byte_value])
             if raw in REALTIME_BYTES:
+                if raw == b"?":
+                    self._maybe_log_no_frame_motion()
                 self.upstream.send_realtime(raw)
                 continue
             text = raw.decode("utf-8", errors="ignore")
             for line in self.line_normalizer.feed(text):
-                self.log.info("Decoded client line %r", line)
+                self.log.debug("Decoded client line %r", line)
+                if line.strip() == "?":
+                    self._maybe_log_no_frame_motion()
+                    self.upstream.send_realtime(b"?")
+                    continue
+                self._observe_lightburn_line(line)
                 event = threading.Event()
                 self.queue.put(QueuedCommand(line=line, done=event))
+
+    def _is_status_poll_line(self, line: str) -> bool:
+        return line.strip() == "?"
+
+    def _is_command_in_progress(self) -> bool:
+        with self._command_state_lock:
+            return self._command_in_progress
+
+    def _set_command_in_progress(self, value: bool) -> None:
+        with self._command_state_lock:
+            self._command_in_progress = value
+
+    def _observe_lightburn_line(self, line: str) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+        upper = stripped.upper()
+        if upper == "$H":
+            self._motion_watch_started_at = time.time()
+            self._motion_candidate_seen = False
+            self._no_motion_logged = False
+        if self._is_motion_candidate_line(upper):
+            self._motion_candidate_seen = True
+            if self._looks_like_pc_frame_attempt(upper) and not self._frame_warning_logged:
+                self.log.warning(
+                    "WARNING: LightBurn PC Frame is not supported in upload-to-Ray5 mode. Use the Ray5 touchscreen Frame function after uploading the file."
+                )
+                self._frame_warning_logged = True
+            return
+        self._maybe_log_no_frame_motion()
+
+    def _is_motion_candidate_line(self, upper_line: str) -> bool:
+        if upper_line.startswith("S"):
+            return True
+        return upper_line.startswith(MOTION_CANDIDATE_PREFIXES)
+
+    def _looks_like_pc_frame_attempt(self, upper_line: str) -> bool:
+        if upper_line.startswith(("G0", "G00", "G1", "G01")) and "X" in upper_line and "Y" in upper_line:
+            return True
+        if upper_line.startswith(("M3", "M4")) and ("S0" in upper_line or " S0" in upper_line):
+            return True
+        return False
+
+    def _maybe_log_no_frame_motion(self) -> None:
+        if self._motion_candidate_seen or self._no_motion_logged:
+            return
+        if (time.time() - self._motion_watch_started_at) > 5.0:
+            self.log.warning("NO FRAME MOTION RECEIVED FROM LIGHTBURN")
+            self._no_motion_logged = True
 
     def _command_worker(self) -> None:
         while not self.closed.is_set():
@@ -1801,6 +2202,8 @@ class BridgeHandler(socketserver.BaseRequestHandler):
             except queue.Empty:
                 continue
             tracker_event = self.tracker.begin()
+            is_status_poll = self._is_status_poll_line(item.line)
+            command_started = False
             try:
                 classification = "unknown"
                 if hasattr(self.upstream, "classify_command"):
@@ -1811,11 +2214,20 @@ class BridgeHandler(socketserver.BaseRequestHandler):
                     classification,
                     item.line,
                 )
+                self.log.info("COMMAND RECEIVED line=%r classification=%s", item.line, classification)
+                if not is_status_poll:
+                    self._set_command_in_progress(True)
+                    command_started = True
+                    self.log.debug("COMMAND START line=%r classification=%s", item.line, classification)
                 self.upstream.send_line(item.line)
+                self.log.info("COMMAND FORWARDED line=%r classification=%s", item.line, classification)
             except Exception as exc:
                 self.log.exception("Failed to send line upstream")
                 self._send_to_client(f"error: upstream send failed: {exc}\n".encode("utf-8"))
                 self.tracker.finish()
+                if command_started:
+                    self._set_command_in_progress(False)
+                    self.log.debug("COMMAND END line=%r result=send_failed", item.line)
                 item.done.set()
                 continue
 
@@ -1823,6 +2235,13 @@ class BridgeHandler(socketserver.BaseRequestHandler):
                 self.log.warning("Timed out waiting for completion of %r", item.line)
                 self._send_to_client(b"error: bridge timeout waiting for upstream response\n")
                 self.tracker.finish()
+                if command_started:
+                    self._set_command_in_progress(False)
+                    self.log.debug("COMMAND END line=%r result=timeout", item.line)
+            else:
+                if command_started:
+                    self._set_command_in_progress(False)
+                    self.log.debug("COMMAND END line=%r result=completed", item.line)
             item.done.set()
 
     def forward_upstream_data(self, payload: bytes) -> None:
@@ -1831,6 +2250,7 @@ class BridgeHandler(socketserver.BaseRequestHandler):
         text = payload.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
         lines = [line for line in text.split("\n") if line]
         if any(self._is_command_completion_line(line) for line in lines):
+            self.log.info("Tracker finish triggered by upstream completion lines %r", lines)
             self.tracker.finish()
 
     def on_upstream_closed(self) -> None:
@@ -1844,6 +2264,7 @@ class BridgeHandler(socketserver.BaseRequestHandler):
             self.request.close()
 
     def complete_current_command(self) -> None:
+        self.log.info("Tracker finish requested explicitly")
         self.tracker.finish()
 
     def _normalize_upstream_payload(self, payload: bytes) -> bytes:
@@ -1857,6 +2278,8 @@ class BridgeHandler(socketserver.BaseRequestHandler):
         return lowered.startswith(TERMINAL_PREFIXES)
 
     def _send_to_client(self, payload: bytes) -> None:
+        self.log.debug("TX client %r", payload)
+        log_protocol("BRIDGE -> LB", payload)
         with self.client_lock:
             try:
                 self.request.sendall(payload)
@@ -1880,8 +2303,19 @@ def main() -> int:
 
     config_path = Path(args.config)
     config = load_config(config_path)
-    log_path = Path(config.get("log_file", "bridge.log"))
+    log_path = resolve_log_path(config_path, config)
     configure_logging(log_path)
+    protocol_log_path = resolve_protocol_log_path(config_path)
+    debug_protocol_enabled = bool(config.get("http", {}).get("debug_protocol", False)) or _is_truthy(os.getenv("DEBUG_PROTOCOL"))
+    configure_protocol_logging(protocol_log_path, enabled=debug_protocol_enabled)
+    retention_days = float(config.get("log_retention_days", 7.0))
+    deleted_logs = prune_old_logs(log_path.parent, retention_days)
+    logging.info("Writing log to %s", log_path)
+    if debug_protocol_enabled:
+        logging.info("Writing protocol log to %s", protocol_log_path)
+    else:
+        logging.info("Protocol debug logging is disabled (set DEBUG_PROTOCOL=true or http.debug_protocol=true to enable)")
+    logging.info("Log retention: %s days (%d old log(s) deleted)", retention_days, deleted_logs)
 
     listen_host = config.get("listen_host", "127.0.0.1")
     listen_port = int(config.get("listen_port", 9000))

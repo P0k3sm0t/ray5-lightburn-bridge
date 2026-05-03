@@ -5,6 +5,8 @@ __pycache__/
 
 # Logs / temp
 *.log
+lightburn_bridge_protocol.log
+logs/
 *.tmp
 *.bak
 
@@ -15,6 +17,7 @@ venv/
 
 # Project-specific (Ray5 bridge)
 config.json
+config.local.*
 *.gc
 *.gcode
 *.nc

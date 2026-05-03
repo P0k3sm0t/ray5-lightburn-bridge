@@ -1,5 +1,5 @@
-{
-  "ray5_host": "192.168.1.50",
+﻿{
+  "ray5_host": "192.168.x.x",
   "ray5_port": 8848,
   "listen_host": "127.0.0.1",
   "listen_port": 9000,
@@ -7,13 +7,15 @@
   "connect_timeout_seconds": 3.0,
   "read_timeout_seconds": 1.0,
   "log_file": "bridge.log",
+  "log_dir": "logs",
+  "log_retention_days": 7,
   "newline": "\n",
   "status_poll_interval_seconds": 0.0,
   "tcp": {
     "recv_chunk_size": 4096
   },
   "websocket": {
-    "url": "ws://192.168.1.50:8849/ws",
+    "url": "ws://192.168.x.x:8849/ws",
     "subprotocols": [],
     "origin": null,
     "append_newline": false,
@@ -21,14 +23,24 @@
     "close_timeout_seconds": 1.0
   },
   "http": {
-    "url": "http://192.168.1.50:8848/command",
+    "url": "http://192.168.x.x:8848/command",
     "method": "GET",
+    "synthetic_grbl_handshake": true,
+    "startup_banner": "Grbl 1.1f ['$' for help]",
+    "synthetic_grbl_version_line": "[VER:1.1f.20211103:grbl-embedded]",
+    "synthetic_grbl_options_line": "[OPT:PHSW,64,256]",
     "content_type": "",
     "headers": {},
     "body_mode": "query_param",
     "body_template": "{command}",
     "command_field": "commandText",
     "response_field": "",
+    "debug_protocol": false,
+    "synthetic_limits": {
+      "x": 390.0,
+      "y": 360.0,
+      "z": 300.0
+    },
     "append_newline_to_body": false,
     "synthetic_status_response": "<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000|WCO:0.000,0.000,0.000|FS:0,0>",
     "spool": {
@@ -42,9 +54,9 @@
       "minimum_job_lines": 10,
       "gzip_level": 6,
       "filename_prefix": "longer",
-      "upload_url": "http://192.168.1.50:8848/upload",
+      "upload_url": "http://192.168.x.x:8848/upload",
       "upload_path": "/",
-      "files_url": "http://192.168.1.50:8848/files",
+      "files_url": "http://192.168.x.x:8848/files",
       "upload_timeout_seconds": 30.0,
       "run_command_template": "$sd/runzip=/{filename}",
       "multipart_filename_mode": "bare",
@@ -55,6 +67,11 @@
       "gzip_os_byte": 3,
       "upload_query_path": true,
       "filename_mode": "short_counter"
+    },
+    "dual_mode": {
+      "upload_minimum_job_lines": 10,
+      "force_frame_live": true,
+      "mode_idle_reset_seconds": 0.75
     }
   }
 }
