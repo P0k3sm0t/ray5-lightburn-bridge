@@ -1,4 +1,4 @@
-# Ray5 LightBurn Bridge
+﻿# Ray5 LightBurn Bridge
 
 This bridge connects LightBurn to a Longer Ray5 over network APIs and is intended for an upload-to-Ray5 workflow.
 
@@ -12,10 +12,24 @@ This bridge connects LightBurn to a Longer Ray5 over network APIs and is intende
 ## Intended Workflow (Recommended)
 
 1. Create your job in LightBurn.
-2. Send/start the job through this bridge so it uploads to the Ray5.
-3. On the Ray5 touchscreen, select the uploaded file.
-4. Use the Ray5 touchscreen Frame function.
-5. Run the job from the Ray5 touchscreen.
+2. Click Start/Play in LightBurn.
+3. The bridge auto-captures the streamed G-code and uploads it to Ray5 storage.
+4. On the Ray5 touchscreen, select the uploaded file.
+5. Use the Ray5 touchscreen Frame function.
+6. Run the job from the Ray5 touchscreen.
+
+## LightBurn Play Auto-Capture
+
+LightBurn normally streams live G-code when Start/Play is pressed.
+
+This bridge can auto-convert that stream into upload/spool mode:
+
+1. Detects a real job stream (line count, motion density, setup/power commands).
+2. Captures lines in memory instead of live-firing the full stream.
+3. Finalizes and uploads a `.gc` file to Ray5 storage.
+4. Leaves auto-start off by default (`start_after_upload=false`).
+
+After upload, use the Ray5 touchscreen to frame and run.
 
 ## Important Limitation
 

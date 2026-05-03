@@ -14,6 +14,7 @@ import socket
 import socketserver
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -408,6 +409,8 @@ class HttpUpstream(UpstreamBase):
         self._cached_status_updated_at = 0.0
         self.dual_mode_config = self.http_config.get("dual_mode", {})
         self._mode_selected = "LIVE"
+        self._live_job_events: deque[tuple[float, str]] = deque()
+        self._live_job_history: deque[str] = deque(maxlen=256)
 
     def classify_command(self, command: str) -> str:
         stripped = command.strip()
@@ -1114,6 +1117,9 @@ class HttpUpstream(UpstreamBase):
             self.handler.forward_upstream_data(synthetic_response.encode("utf-8"))
             return True
 
+        if self._maybe_capture_live_job_line(stripped):
+            return True
+
         if self._is_live_motion_passthrough_command(stripped) and not self._upload_mode_active():
             self._mode_selected = "LIVE"
             self.log.info("MODE SELECTED: LIVE")
@@ -1155,9 +1161,117 @@ class HttpUpstream(UpstreamBase):
             self._spool_has_job_marker = self._spool_has_job_marker or self._is_job_marker_command(stripped)
             job_line_count = len(self._spool_lines)
             self._ensure_spool_monitor_locked()
-        self.log.info("UPLOAD JOB BUFFERED line=%r count=%d", stripped, job_line_count)
+        if job_line_count <= 3 or job_line_count % 25 == 0:
+            self.log.info("UPLOAD JOB BUFFERED count=%d", job_line_count)
         self.handler.forward_upstream_data(b"ok\n")
         return True
+
+    def _maybe_capture_live_job_line(self, command: str) -> bool:
+        if not bool(self.spool_config.get("auto_capture_live_jobs", True)):
+            return False
+        upper = command.strip().upper()
+        if not upper or upper.startswith("$") or upper.startswith("[") or upper.startswith("<") or upper == "?":
+            return False
+
+        now = time.time()
+        self._live_job_history.append(command.strip())
+        self._live_job_events.append((now, upper))
+        window_seconds = max(0.2, float(self.spool_config.get("job_detect_window_seconds", 2.0)))
+        cutoff = now - window_seconds
+        while self._live_job_events and self._live_job_events[0][0] < cutoff:
+            self._live_job_events.popleft()
+
+        if self._upload_mode_active():
+            self._capture_spool_line(command.strip())
+            return True
+
+        if not self._looks_like_live_motion_command(upper):
+            return False
+
+        if not self._is_live_job_detected():
+            return False
+
+        self._start_live_job_capture()
+        self._capture_spool_line(command.strip())
+        return True
+
+    def _is_live_job_detected(self) -> bool:
+        events = list(self._live_job_events)
+        if not events:
+            return False
+        minimum_job_lines = int(self.spool_config.get("minimum_job_lines", 10))
+        motion_count = sum(
+            1
+            for _, line in events
+            if line.startswith(("G0", "G00", "G1", "G01", "G2", "G02", "G3", "G03"))
+        )
+        setup_count = sum(
+            1
+            for _, line in events
+            if line.startswith(("G90", "G91", "G20", "G21", "M3", "M4", "M5", "S", "F"))
+        )
+        has_terminal = any(line.startswith(("M2", "M30")) for _, line in events)
+        power_seen = any(
+            line.startswith(("M3", "M4", "S"))
+            for _, line in events
+        )
+        first_time = events[0][0]
+        elapsed = max(0.0, time.time() - first_time)
+        frame_idle = max(0.1, float(self.spool_config.get("frame_idle_seconds", 0.35)))
+        if has_terminal and motion_count >= 3:
+            return True
+        if len(events) >= minimum_job_lines:
+            return True
+        if power_seen and motion_count >= 4 and setup_count >= 2:
+            return True
+        if elapsed > frame_idle and motion_count >= max(6, minimum_job_lines // 2):
+            return True
+        return False
+
+    def _start_live_job_capture(self) -> None:
+        seed_lines = self._seed_capture_lines_from_history()
+        with self._spool_lock:
+            if self._spool_job_started:
+                return
+            self._mode_selected = "UPLOAD"
+            self.log.info("MODE SELECTED: UPLOAD")
+            self._spool_job_started = True
+            self._spool_started_at = time.time()
+            self._spool_last_line_at = time.time()
+            self._spool_lines = list(seed_lines)
+            self._spool_has_job_marker = any(self._is_job_marker_command(line) for line in seed_lines)
+            self._interactive_live_until = 0.0
+            self._ensure_spool_monitor_locked()
+            captured = len(self._spool_lines)
+        self.log.info("job capture started (seeded_lines=%d)", captured)
+
+    def _capture_spool_line(self, line: str) -> None:
+        with self._spool_lock:
+            if not self._spool_job_started:
+                return
+            self._spool_last_line_at = time.time()
+            self._spool_lines.append(line)
+            self._spool_has_job_marker = self._spool_has_job_marker or self._is_job_marker_command(line)
+            job_line_count = len(self._spool_lines)
+        if job_line_count <= 3 or job_line_count % 25 == 0:
+            self.log.info("lines captured=%d", job_line_count)
+        self.handler.forward_upstream_data(b"ok\n")
+
+    def _seed_capture_lines_from_history(self) -> list[str]:
+        minimum_job_lines = int(self.spool_config.get("minimum_job_lines", 10))
+        max_seed = max(minimum_job_lines, 40)
+        lines: list[str] = []
+        for raw in list(self._live_job_history)[-max_seed:]:
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            upper = stripped.upper()
+            if upper == "?":
+                continue
+            if upper.startswith("[") or upper.startswith("<"):
+                continue
+            lines.append(stripped)
+        return lines
 
     def _ensure_spool_monitor_locked(self) -> None:
         if self._spool_upload_thread is not None and self._spool_upload_thread.is_alive():
@@ -1191,6 +1305,7 @@ class HttpUpstream(UpstreamBase):
             self.log.info("Discarded buffered job with %d lines as likely handshake chatter", len(lines))
             return
 
+        self.log.info("file finalized (captured_lines=%d)", len(lines))
         try:
             filename, started = self._upload_and_maybe_start_spooled_job(lines)
         except Exception as exc:
@@ -1208,12 +1323,16 @@ class HttpUpstream(UpstreamBase):
             self._spool_last_upload_only = not started
             self._spool_run_observed_active = False
             self._manual_sd_run_passive = False
+        if started:
+            self.log.info("upload success: %s (auto-start performed)", filename)
+        else:
+            self.log.info("upload success: %s", filename)
+            self.log.info("Job uploaded to Ray5 storage. Start it from the touchscreen.")
 
     def _upload_and_maybe_start_spooled_job(self, lines: list[str]) -> tuple[str, bool]:
         with self._spool_lock:
             controller_state = self._last_controller_state
-        if controller_state == "ALARM":
-            raise BridgeProtocolError("controller is in Alarm state; clear the alarm and home/unlock the Ray5 before uploading")
+        controller_alarm_active = controller_state == "ALARM"
 
         start_after_upload = bool(self.spool_config.get("start_after_upload", True))
         upload_format = str(self.spool_config.get("upload_format", "gc_gz")).lower()
@@ -1263,7 +1382,16 @@ class HttpUpstream(UpstreamBase):
 
         run_filename = self._pick_run_filename(uploaded_filenames)
         if not start_after_upload:
+            if controller_alarm_active:
+                self.log.warning(
+                    "Controller is in Alarm state. File uploaded only. Clear alarm/home before running from screen."
+                )
+            self.log.info("auto-start skipped (start_after_upload=false)")
             self.log.info("Spool uploaded %s and left it on SD without starting", ", ".join(uploaded_filenames))
+            return run_filename, False
+
+        if controller_alarm_active:
+            self.log.warning("Upload complete, but auto-start skipped because controller is in Alarm state.")
             return run_filename, False
 
         run_command = run_command_template.format(filename=run_filename)
@@ -1878,7 +2006,7 @@ class HttpUpstream(UpstreamBase):
         return text or '0'
 
     def _next_spool_filename(self, compress_upload: bool) -> str:
-        prefix = str(self.spool_config.get("filename_prefix", "longer")).strip()
+        prefix = str(self.spool_config.get("filename_prefix", "lightburn_job")).strip()
         filename_mode = str(self.spool_config.get("filename_mode", "short_counter")).strip().lower()
         separator = "" if not prefix or prefix.endswith(("_", "-")) else "_"
         timestamp = time.strftime("%Y%m%d_%H%M%S")
