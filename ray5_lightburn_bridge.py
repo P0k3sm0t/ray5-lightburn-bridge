@@ -12,6 +12,7 @@ import queue
 import re
 import socket
 import socketserver
+import subprocess
 import threading
 import time
 from collections import deque
@@ -129,6 +130,502 @@ def _is_truthy(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class CameraCaptureError(RuntimeError):
+    pass
+
+
+class CameraManager:
+    def __init__(self, camera_config: dict[str, Any], base_dir: Path) -> None:
+        self.log = logging.getLogger("CameraManager")
+        self.enabled = bool(camera_config.get("enabled", False))
+        self.url = str(camera_config.get("url", "")).strip()
+        self.snapshot_url = str(camera_config.get("snapshot_url", "")).strip()
+        output_dir = Path(str(camera_config.get("output_dir", "camera_captures")).strip() or "camera_captures")
+        if not output_dir.is_absolute():
+            output_dir = base_dir / output_dir
+        self.output_dir = output_dir
+        self.filename_prefix = str(camera_config.get("filename_prefix", "ray5_bed")).strip() or "ray5_bed"
+        self.keep_last = camera_config.get("keep_last", 25)
+        self.auto_capture_on_upload = bool(camera_config.get("auto_capture_on_upload", True))
+        self.auto_capture_on_start = bool(camera_config.get("auto_capture_on_start", False))
+        self.capture_method = str(camera_config.get("capture_method", "auto")).strip().lower() or "auto"
+        self.timeout_seconds = max(1.0, float(camera_config.get("timeout_seconds", 10.0)))
+        self.open_capture_folder_on_start = bool(camera_config.get("open_capture_folder_on_start", False))
+        deskew_config = camera_config.get("deskew", {}) if isinstance(camera_config.get("deskew", {}), dict) else {}
+        self.deskew_enabled = bool(deskew_config.get("enabled", False))
+        self.deskew_source_points = deskew_config.get("source_points", [])
+        self.deskew_output_size = deskew_config.get("output_size", [])
+        postprocess_config = camera_config.get("postprocess", {}) if isinstance(camera_config.get("postprocess", {}), dict) else {}
+        self.postprocess_enabled = bool(postprocess_config.get("enabled", False))
+        self.postprocess_scale = float(postprocess_config.get("scale", 1.0))
+        self.postprocess_center_crop_margin = int(postprocess_config.get("center_crop_margin", 0))
+        self.postprocess_rotate_degrees = int(postprocess_config.get("rotate_degrees", 0))
+        self.postprocess_final_size = postprocess_config.get("final_size", [1200, 1200])
+        self.postprocess_dpi = float(postprocess_config.get("dpi", 101.6))
+        overlay_config = postprocess_config.get("overlay_guides", {}) if isinstance(postprocess_config.get("overlay_guides", {}), dict) else {}
+        self.overlay_guides_enabled = bool(overlay_config.get("enabled", False))
+        self.overlay_draw_center_cross = bool(overlay_config.get("draw_center_cross", True))
+        self.overlay_draw_border = bool(overlay_config.get("draw_border", True))
+        self.overlay_draw_corner_marks = bool(overlay_config.get("draw_corner_marks", True))
+        self._deskew_reason_disabled: str | None = None
+        self._lock = threading.Lock()
+        self._session = requests.Session()
+        self._session.trust_env = False
+        self.latest_raw_path = self.output_dir / "latest_raw.jpg"
+        self.latest_path = self.output_dir / "latest.jpg"
+        self.latest_instructions_path = self.output_dir / "latest_lightburn_instructions.txt"
+
+        if not self.enabled:
+            return
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._prune_old_captures()
+        self.log.info("Camera captures directory ready at %s", self.output_dir)
+        if not self._has_configured_source():
+            self.log.warning("Camera is enabled, but no valid snapshot_url/url is configured yet.")
+        self._validate_deskew_config()
+        if self.deskew_enabled:
+            self.log.info("Camera deskew is enabled")
+            self.log.info("[CAMERA] Deskew enabled")
+        if self.postprocess_enabled:
+            final_w, final_h = self._parse_deskew_output_size(self.postprocess_final_size, default=(1200, 1200))
+            self.log.info("[CAMERA] Postprocess final size: %sx%s", final_w, final_h)
+            self.log.info("[CAMERA] Output DPI: %s", self.postprocess_dpi)
+            self.log.info("[CAMERA] Rotation: %s", self.postprocess_rotate_degrees)
+            self.log.info("[CAMERA] Scale: %s", self.postprocess_scale)
+
+    def _has_configured_source(self) -> bool:
+        return self._select_capture_source(allow_placeholder=False) is not None
+
+    def _is_placeholder_url(self, candidate: str) -> bool:
+        return "CAMERA_IP_OR_" in candidate
+
+    def _is_http_url(self, candidate: str) -> bool:
+        parsed = urlsplit(candidate)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    def _is_rtsp_url(self, candidate: str) -> bool:
+        parsed = urlsplit(candidate)
+        return parsed.scheme == "rtsp" and bool(parsed.netloc)
+
+    def _is_usable_url(self, candidate: str, allow_placeholder: bool) -> bool:
+        if not candidate:
+            return False
+        parsed = urlsplit(candidate)
+        if not parsed.netloc:
+            return False
+        if not allow_placeholder and self._is_placeholder_url(candidate):
+            return False
+        return True
+
+    def _select_capture_source(self, allow_placeholder: bool = False) -> tuple[str, str] | None:
+        snapshot = self.snapshot_url.strip()
+        stream = self.url.strip()
+
+        if self._is_usable_url(snapshot, allow_placeholder) and self._is_http_url(snapshot):
+            return "http", snapshot
+
+        rtsp_candidates: list[str] = []
+        for candidate in (snapshot, stream):
+            if self._is_usable_url(candidate, allow_placeholder) and self._is_rtsp_url(candidate):
+                rtsp_candidates.append(candidate)
+
+        if self.capture_method == "ffmpeg" and rtsp_candidates:
+            return "rtsp_ffmpeg", rtsp_candidates[0]
+
+        if self._is_usable_url(stream, allow_placeholder) and self._is_http_url(stream):
+            return "http", stream
+
+        if rtsp_candidates:
+            return "rtsp_ffmpeg", rtsp_candidates[0]
+
+        return None
+
+    def capture(self, reason: str = "manual") -> Path:
+        if not self.enabled:
+            raise CameraCaptureError("camera capture is disabled in config.json")
+
+        source = self._select_capture_source()
+        if source is None:
+            raise CameraCaptureError("camera is enabled but snapshot_url/url is not configured")
+        source_type, source_url = source
+
+        with self._lock:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            capture_path = self.output_dir / f"{self.filename_prefix}_{timestamp}.jpg"
+            capture_raw_path = self.output_dir / f"{self.filename_prefix}_{timestamp}_raw.jpg"
+            if source_type == "http":
+                image_bytes = self._fetch_capture_bytes(source_url)
+                self.latest_raw_path.write_bytes(image_bytes)
+            else:
+                self._capture_rtsp_snapshot_with_ffmpeg(source_url, self.latest_raw_path)
+                if not self.latest_raw_path.exists() or self.latest_raw_path.stat().st_size == 0:
+                    raise CameraCaptureError("RTSP snapshot did not produce an image")
+
+            capture_raw_path.write_bytes(self.latest_raw_path.read_bytes())
+            self.log.info("[CAMERA] Raw snapshot saved: %s", self._camera_display_path(self.latest_raw_path))
+            self._create_corrected_from_raw()
+            capture_path.write_bytes(self.latest_path.read_bytes())
+            self._write_lightburn_instructions_file()
+            self._prune_old_captures()
+            self.log.info("Camera capture saved (%s): %s", reason, capture_path)
+            return capture_path
+
+    def _create_corrected_from_raw(self) -> None:
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception:
+            if self.deskew_enabled or self.postprocess_enabled:
+                self.log.warning("[CAMERA] Deskew requested but OpenCV is not installed.")
+            self.latest_path.write_bytes(self.latest_raw_path.read_bytes())
+            return
+
+        try:
+            image = cv2.imread(str(self.latest_raw_path))
+            if image is None:
+                raise CameraCaptureError(f"failed to read raw image {self.latest_raw_path}")
+        except Exception as exc:
+            self.log.warning("[CAMERA] Deskew failed, using raw image as latest.jpg: %s", exc)
+            self.latest_path.write_bytes(self.latest_raw_path.read_bytes())
+            return
+
+        try:
+            if self.deskew_enabled:
+                source_points = np.array(self._parse_deskew_source_points(self.deskew_source_points), dtype="float32")
+                output_size = self._parse_deskew_output_size(self.deskew_output_size)
+                destination_points = np.array(
+                    [
+                        [0.0, 0.0],
+                        [float(output_size[0]), 0.0],
+                        [float(output_size[0]), float(output_size[1])],
+                        [0.0, float(output_size[1])],
+                    ],
+                    dtype="float32",
+                )
+                matrix = cv2.getPerspectiveTransform(source_points, destination_points)
+                image = cv2.warpPerspective(image, matrix, output_size)
+                self.log.info("[CAMERA] Deskew applied")
+            else:
+                self.log.info("[CAMERA] Deskew disabled, saved raw image as latest.jpg")
+        except Exception as exc:
+            self.log.warning("[CAMERA] Deskew failed, using raw image as latest.jpg: %s", exc)
+            self.latest_path.write_bytes(self.latest_raw_path.read_bytes())
+            return
+
+        deskew_or_raw_image = image
+        if self.postprocess_enabled:
+            try:
+                image = self._apply_postprocess(image, cv2)
+            except Exception as exc:
+                self.log.warning("[CAMERA] Postprocess failed, using deskewed image as latest.jpg: %s", exc)
+                image = deskew_or_raw_image
+
+        if self.overlay_guides_enabled:
+            image = self._draw_overlay_guides(image, cv2)
+
+        if not cv2.imwrite(str(self.latest_path), image):
+            raise CameraCaptureError(f"failed to write final image {self.latest_path}")
+        self._write_dpi_metadata(self.latest_path)
+        self.log.info("[CAMERA] Final image saved: %s", self._camera_display_path(self.latest_path))
+
+    def _apply_postprocess(self, image: Any, cv2: Any) -> Any:
+        final_w, final_h = self._parse_deskew_output_size(self.postprocess_final_size, default=(1200, 1200))
+        scale = self.postprocess_scale
+        crop_margin = self.postprocess_center_crop_margin
+        rotate_degrees = self.postprocess_rotate_degrees
+
+        if scale != 1.0:
+            h, w = image.shape[:2]
+            scaled_w = int(w * scale)
+            scaled_h = int(h * scale)
+            image = cv2.resize(image, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
+
+            start_x = max((scaled_w - final_w) // 2, 0)
+            start_y = max((scaled_h - final_h) // 2, 0)
+            image = image[start_y:start_y + final_h, start_x:start_x + final_w]
+
+            if image.shape[1] != final_w or image.shape[0] != final_h:
+                image = cv2.resize(image, (final_w, final_h), interpolation=cv2.INTER_LINEAR)
+
+        if crop_margin > 0:
+            h, w = image.shape[:2]
+            if crop_margin * 2 >= h or crop_margin * 2 >= w:
+                raise CameraCaptureError(
+                    f"center_crop_margin too large for image size {w}x{h}: margin={crop_margin}"
+                )
+            cropped = image[crop_margin:h - crop_margin, crop_margin:w - crop_margin]
+            image = cv2.resize(cropped, (final_w, final_h), interpolation=cv2.INTER_LINEAR)
+
+        if rotate_degrees == 90:
+            image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            self.log.info("[CAMERA] Rotated final image 90 degrees CCW")
+        elif rotate_degrees == 180:
+            image = cv2.rotate(image, cv2.ROTATE_180)
+            self.log.info("[CAMERA] Rotated final image 180 degrees")
+        elif rotate_degrees == 270:
+            image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+            self.log.info("[CAMERA] Rotated final image 270 degrees")
+
+        if image.shape[1] != final_w or image.shape[0] != final_h:
+            image = cv2.resize(image, (final_w, final_h), interpolation=cv2.INTER_LINEAR)
+
+        self.log.info(
+            "[CAMERA] Postprocess applied: scale=%s crop_margin=%s final_size=%sx%s",
+            scale,
+            crop_margin,
+            final_w,
+            final_h,
+        )
+        return image
+
+    def _write_dpi_metadata(self, final_path: Path) -> None:
+        try:
+            from PIL import Image  # type: ignore
+        except Exception:
+            self.log.warning("[CAMERA] Pillow not installed, DPI metadata not written.")
+            return
+        try:
+            with Image.open(final_path) as image:
+                image.save(final_path, dpi=(self.postprocess_dpi, self.postprocess_dpi))
+            self.log.info("[CAMERA] DPI metadata written: %s", self.postprocess_dpi)
+        except Exception as exc:
+            self.log.warning("[CAMERA] Failed to write DPI metadata: %s", exc)
+
+    def _draw_overlay_guides(self, image: Any, cv2: Any) -> Any:
+        canvas = image.copy()
+        h, w = canvas.shape[:2]
+        line_color = (40, 40, 40)
+        line_thickness = 1
+
+        if self.overlay_draw_border:
+            cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), line_color, line_thickness, lineType=cv2.LINE_AA)
+        if self.overlay_draw_center_cross:
+            cx = w // 2
+            cy = h // 2
+            cv2.line(canvas, (cx, 0), (cx, h - 1), line_color, line_thickness, lineType=cv2.LINE_AA)
+            cv2.line(canvas, (0, cy), (w - 1, cy), line_color, line_thickness, lineType=cv2.LINE_AA)
+        if self.overlay_draw_corner_marks:
+            mark = max(10, min(w, h) // 30)
+            # top-left
+            cv2.line(canvas, (0, 0), (mark, 0), line_color, line_thickness, lineType=cv2.LINE_AA)
+            cv2.line(canvas, (0, 0), (0, mark), line_color, line_thickness, lineType=cv2.LINE_AA)
+            # top-right
+            cv2.line(canvas, (w - 1, 0), (w - 1 - mark, 0), line_color, line_thickness, lineType=cv2.LINE_AA)
+            cv2.line(canvas, (w - 1, 0), (w - 1, mark), line_color, line_thickness, lineType=cv2.LINE_AA)
+            # bottom-right
+            cv2.line(canvas, (w - 1, h - 1), (w - 1 - mark, h - 1), line_color, line_thickness, lineType=cv2.LINE_AA)
+            cv2.line(canvas, (w - 1, h - 1), (w - 1, h - 1 - mark), line_color, line_thickness, lineType=cv2.LINE_AA)
+            # bottom-left
+            cv2.line(canvas, (0, h - 1), (mark, h - 1), line_color, line_thickness, lineType=cv2.LINE_AA)
+            cv2.line(canvas, (0, h - 1), (0, h - 1 - mark), line_color, line_thickness, lineType=cv2.LINE_AA)
+        return canvas
+
+    def _write_lightburn_instructions_file(self) -> None:
+        instructions = [
+            "Drag latest.jpg into LightBurn.",
+            "Confirm size imports as 300.00 mm x 300.00 mm.",
+            "Put camera image on C00 or any layer with Output OFF.",
+            "Lock the image.",
+            "Use Absolute Coords.",
+            "Center image/grid to the 300x300 reference grid.",
+            "Place artwork over the material.",
+            "Always Frame before Start.",
+            "",
+        ]
+        self.latest_instructions_path.write_text("\n".join(instructions), encoding="utf-8")
+
+    def open_capture_folder(self) -> None:
+        try:
+            os.startfile(str(self.output_dir))  # type: ignore[attr-defined]
+        except Exception as exc:
+            self.log.warning("[CAMERA] Unable to open capture folder: %s", exc)
+
+    def _camera_display_path(self, path: Path) -> str:
+        return f"{self.output_dir.name}/{path.name}"
+
+    def _parse_deskew_source_points(self, source_points: Any) -> list[list[float]]:
+        if not isinstance(source_points, list) or len(source_points) != 4:
+            raise CameraCaptureError("deskew.source_points must contain exactly 4 [x,y] points")
+        parsed: list[list[float]] = []
+        for point in source_points:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise CameraCaptureError("each deskew.source_points entry must be [x,y]")
+            try:
+                x = float(point[0])
+                y = float(point[1])
+            except (TypeError, ValueError) as exc:
+                raise CameraCaptureError("deskew.source_points values must be numeric") from exc
+            parsed.append([x, y])
+        return parsed
+
+    def _parse_deskew_output_size(self, output_size: Any, default: tuple[int, int] | None = None) -> tuple[int, int]:
+        if not isinstance(output_size, (list, tuple)) or len(output_size) != 2:
+            if default is not None:
+                return default
+            raise CameraCaptureError("deskew.output_size must be [width,height]")
+        try:
+            width = int(output_size[0])
+            height = int(output_size[1])
+        except (TypeError, ValueError) as exc:
+            raise CameraCaptureError("deskew.output_size values must be integers") from exc
+        if width <= 0 or height <= 0:
+            raise CameraCaptureError("deskew.output_size values must be > 0")
+        return width, height
+
+    def _capture_rtsp_snapshot_with_ffmpeg(self, source_url: str, output_path: Path) -> None:
+        command = [
+            "ffmpeg",
+            "-y",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            source_url,
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            str(output_path),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            self.log.warning("[CAMERA] RTSP snapshot failed: ffmpeg not found in PATH")
+            raise CameraCaptureError("ffmpeg not found in PATH") from exc
+        except subprocess.TimeoutExpired as exc:
+            self.log.warning("[CAMERA] RTSP snapshot failed: ffmpeg timed out")
+            raise CameraCaptureError("ffmpeg timed out while capturing RTSP frame") from exc
+        except OSError as exc:
+            self.log.warning("[CAMERA] RTSP snapshot failed: %s", exc)
+            raise CameraCaptureError(f"ffmpeg failed to execute: {exc}") from exc
+
+        if completed.returncode != 0:
+            stderr_text = (completed.stderr or "").strip()
+            stdout_text = (completed.stdout or "").strip()
+            detail = stderr_text or stdout_text or f"exit code {completed.returncode}"
+            self.log.warning("[CAMERA] RTSP snapshot failed: %s", detail)
+            raise CameraCaptureError(f"ffmpeg RTSP capture failed: {detail}")
+
+    def _fetch_capture_bytes(self, source_url: str) -> bytes:
+        response = None
+        try:
+            response = self._session.get(
+                source_url,
+                stream=True,
+                timeout=self.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise CameraCaptureError(f"camera request failed: {exc}") from exc
+
+        try:
+            if not response.ok:
+                raise CameraCaptureError(f"camera returned HTTP {response.status_code}: {response.reason}")
+
+            content_type = str(response.headers.get("Content-Type", "")).lower()
+            if "multipart/x-mixed-replace" in content_type or "multipart/" in content_type:
+                frame = self._read_first_jpeg_frame(response)
+                if frame:
+                    return frame
+                raise CameraCaptureError("camera stream did not produce a JPEG frame")
+
+            body = response.content
+            if not body:
+                raise CameraCaptureError("camera response was empty")
+
+            extracted = self._extract_jpeg_from_bytes(body)
+            if extracted:
+                return extracted
+
+            if content_type.startswith("image/"):
+                return body
+
+            if source_url == self.url:
+                frame = self._extract_jpeg_from_stream_body(body)
+                if frame:
+                    return frame
+
+            raise CameraCaptureError(f"camera response did not contain a usable image (content-type={content_type or 'unknown'})")
+        finally:
+            response.close()
+
+    def _read_first_jpeg_frame(self, response: requests.Response) -> bytes | None:
+        buffer = bytearray()
+        for chunk in response.iter_content(chunk_size=4096):
+            if not chunk:
+                continue
+            buffer.extend(chunk)
+            frame = self._extract_jpeg_from_bytes(buffer)
+            if frame:
+                return frame
+            if len(buffer) > 4 * 1024 * 1024:
+                marker = buffer.find(b"\xff\xd8")
+                if marker > 0:
+                    del buffer[:marker]
+                elif marker < 0:
+                    del buffer[:-65536]
+        return None
+
+    def _extract_jpeg_from_stream_body(self, body: bytes) -> bytes | None:
+        return self._extract_jpeg_from_bytes(body)
+
+    def _extract_jpeg_from_bytes(self, body: bytes | bytearray) -> bytes | None:
+        start = bytes(body).find(b"\xff\xd8")
+        if start < 0:
+            return None
+        end = bytes(body).find(b"\xff\xd9", start + 2)
+        if end < 0:
+            return None
+        return bytes(body[start:end + 2])
+
+    def _prune_old_captures(self) -> None:
+        try:
+            keep_last = int(self.keep_last)
+        except (TypeError, ValueError):
+            return
+        if keep_last <= 0:
+            return
+
+        pattern = re.compile(rf"^{re.escape(self.filename_prefix)}_(\d{{8}}_\d{{6}})(?:_raw)?\.jpg$")
+        timestamps = set[str]()
+        for candidate in self.output_dir.glob(f"{self.filename_prefix}_*.jpg"):
+            matched = pattern.match(candidate.name)
+            if matched:
+                timestamps.add(matched.group(1))
+
+        ordered = sorted(timestamps, reverse=True)
+        for stale_stamp in ordered[keep_last:]:
+            stale_files = [
+                self.output_dir / f"{self.filename_prefix}_{stale_stamp}.jpg",
+                self.output_dir / f"{self.filename_prefix}_{stale_stamp}_raw.jpg",
+            ]
+            for stale_path in stale_files:
+                if not stale_path.exists():
+                    continue
+                if stale_path.name in {"latest.jpg", "latest_raw.jpg"}:
+                    continue
+                try:
+                    stale_path.unlink()
+                except OSError:
+                    self.log.warning("Failed to delete old camera capture %s", stale_path, exc_info=True)
+
+    def _validate_deskew_config(self) -> None:
+        if not self.deskew_enabled:
+            return
+        try:
+            self._parse_deskew_source_points(self.deskew_source_points)
+            self._parse_deskew_output_size(self.deskew_output_size)
+        except CameraCaptureError as exc:
+            self._deskew_reason_disabled = str(exc)
+            self.deskew_enabled = False
+            self.log.warning("[CAMERA] Deskew config invalid; disabling deskew for this run: %s", exc)
 
 
 def _format_http_request(prepared: requests.PreparedRequest) -> str:
@@ -368,6 +865,8 @@ class HttpUpstream(UpstreamBase):
         self.session.trust_env = False
         self.http_config = config.get("http", {})
         self.spool_config = self.http_config.get("spool", {})
+        self.pump_config = config.get("pump_control", {})
+        self.camera_manager: CameraManager | None = getattr(handler.server, "camera_manager", None)
         self._command_exchange_lock = threading.Lock()
         self._spool_lock = threading.Lock()
         self._spool_lines: list[str] = []
@@ -411,11 +910,32 @@ class HttpUpstream(UpstreamBase):
         self._mode_selected = "LIVE"
         self._live_job_events: deque[tuple[float, str]] = deque()
         self._live_job_history: deque[str] = deque(maxlen=256)
+        self._pump_passthrough_m8_m9 = bool(self.pump_config.get("enabled", True)) and bool(
+            self.pump_config.get("passthrough_m8_m9", True)
+        )
+        self._pump_inject_on_upload_start = bool(self.pump_config.get("enabled", True)) and bool(
+            self.pump_config.get("inject_on_upload_start", False)
+        )
+        self._pump_inject_off_upload_end = bool(self.pump_config.get("enabled", True)) and bool(
+            self.pump_config.get("inject_off_upload_end", False)
+        )
+
+    def _maybe_capture_camera_snapshot(self, reason: str, *, required: bool = False) -> Path | None:
+        if self.camera_manager is None:
+            return None
+        try:
+            return self.camera_manager.capture(reason=reason)
+        except CameraCaptureError as exc:
+            log_method = self.log.warning if required else self.log.warning
+            log_method("Camera capture skipped (%s): %s", reason, exc)
+            return None
 
     def classify_command(self, command: str) -> str:
         stripped = command.strip()
         if not stripped:
             return "empty"
+        if self._is_pump_command(stripped):
+            return "pump_command"
         if stripped == "?":
             return "status"
         if stripped.startswith("$"):
@@ -770,7 +1290,8 @@ class HttpUpstream(UpstreamBase):
 
     def _open_sideband_websocket(self) -> None:
         ws_config = self.config.get("websocket", {})
-        ws_url = ws_config.get("url")
+        ws_url_raw = ws_config.get("url")
+        ws_url = str(ws_url_raw).strip() if ws_url_raw is not None else ""
         if not ws_url:
             return
         try:
@@ -1108,6 +1629,8 @@ class HttpUpstream(UpstreamBase):
             self.classify_command(stripped),
             stripped,
         )
+        if self._is_pump_command(stripped):
+            self.log.info("[PUMP] %s received from LightBurn", self._pump_command_token(stripped))
         if self._is_passthrough_command(stripped):
             return False
 
@@ -1125,6 +1648,8 @@ class HttpUpstream(UpstreamBase):
             self.log.info("MODE SELECTED: LIVE")
             self.log.info("LIVE PASSTHROUGH COMMAND line=%r", stripped)
             response_text = self._issue_http_command(stripped)
+            if self._is_pump_command(stripped):
+                self.log.info("[PUMP] %s forwarded to Ray5", self._pump_command_token(stripped))
             self.handler.forward_upstream_data(response_text.encode("utf-8"))
             return True
 
@@ -1134,6 +1659,8 @@ class HttpUpstream(UpstreamBase):
             self.log.info("LIVE PASSTHROUGH COMMAND line=%r", stripped)
             self.log.info("TX HTTP immediate live passthrough line %r", stripped)
             response_text = self._issue_http_command(stripped)
+            if self._is_pump_command(stripped):
+                self.log.info("[PUMP] %s forwarded to Ray5", self._pump_command_token(stripped))
             self.handler.forward_upstream_data(response_text.encode("utf-8"))
             self._mark_interactive_live_line(stripped)
             return True
@@ -1144,6 +1671,8 @@ class HttpUpstream(UpstreamBase):
             self.log.info("LIVE PASSTHROUGH COMMAND line=%r", stripped)
             self.log.info("TX HTTP passthrough non-job line %r", stripped)
             response_text = self._issue_http_command(stripped)
+            if self._is_pump_command(stripped):
+                self.log.info("[PUMP] %s forwarded to Ray5", self._pump_command_token(stripped))
             self.handler.forward_upstream_data(response_text.encode("utf-8"))
             return True
 
@@ -1342,6 +1871,7 @@ class HttpUpstream(UpstreamBase):
         body_lines = list(lines)
         if bool(self.spool_config.get("screen_compatible_rewrite", True)):
             body_lines = self._rewrite_for_screen_compatibility(body_lines)
+        body_lines = self._apply_pump_injection(body_lines)
         body = ("\n".join(body_lines) + "\n").encode("utf-8")
 
         upload_url = self.spool_config.get("upload_url")
@@ -1364,6 +1894,9 @@ class HttpUpstream(UpstreamBase):
         for filename, upload_bytes, upload_kind in uploads:
             self._upload_spool_file(upload_url, upload_path, filename, upload_bytes, upload_kind)
             uploaded_filenames.append(filename)
+
+        if self.camera_manager is not None and self.camera_manager.auto_capture_on_upload:
+            self._maybe_capture_camera_snapshot("upload")
 
         if files_url:
             self.log.info("Spool listing files via %s", files_url)
@@ -1398,6 +1931,8 @@ class HttpUpstream(UpstreamBase):
         self.log.info("Spool starting uploaded file with %r", run_command)
         start_response = self._issue_http_command(run_command)
         self.log.info("Spool start response %r", start_response.strip())
+        if self.camera_manager is not None and self.camera_manager.auto_capture_on_start:
+            self._maybe_capture_camera_snapshot("job_start")
         return run_filename, True
 
     def _make_gzip_bytes(self, body: bytes) -> bytes:
@@ -1518,22 +2053,15 @@ class HttpUpstream(UpstreamBase):
             if not line or line.startswith(';'):
                 continue
             compact = self._compact_gcode_spacing(line)
-            if compact == 'M8':
-                continue
             if convert_m4_to_m3 and compact == 'M4':
                 compact = 'M3'
             normalized.append(compact)
 
         footer_start = len(normalized)
         for idx in range(len(normalized) - 1, -1, -1):
-            if normalized[idx] == 'M9':
+            if normalized[idx] in {'M5', 'M2'}:
                 footer_start = idx
                 break
-        if footer_start == len(normalized):
-            for idx in range(len(normalized) - 1, -1, -1):
-                if normalized[idx] in {'M5', 'M2'}:
-                    footer_start = idx
-                    break
 
         motion_source = normalized[:footer_start]
         footer_source = normalized[footer_start:]
@@ -1569,7 +2097,7 @@ class HttpUpstream(UpstreamBase):
             if upper == 'G91':
                 absolute_mode = False
                 continue
-            if upper in {'M9', 'M5', 'M2'}:
+            if upper in {'M5', 'M2'}:
                 continue
 
             line, feed_value = self._extract_feed_token(line)
@@ -1613,8 +2141,11 @@ class HttpUpstream(UpstreamBase):
         footer_seen = set()
         for line in footer_source:
             compact = self._compact_gcode_spacing(line)
-            if compact in {'M9', 'M5', 'G90'} and compact not in footer_seen:
+            if compact in {'M5', 'G90'} and compact not in footer_seen:
                 footer_seen.add(compact)
+                continue
+            if compact in {'M8', 'M9'}:
+                motion_lines.append(compact)
                 continue
             if compact in {'G1S0', 'G1 S0'} and 'G1 S0' not in footer_seen:
                 footer_seen.add('G1 S0')
@@ -1643,7 +2174,8 @@ class HttpUpstream(UpstreamBase):
             result.append(f'F{current_feed}')
         result.extend(motion_lines)
         result.append('')
-        result.append('M9')
+        if 'M9' not in motion_lines:
+            result.append('M9')
         result.append('G1 S0')
         result.append('M5')
         result.append('G90')
@@ -2089,6 +2621,8 @@ class HttpUpstream(UpstreamBase):
             return True
         if upper.startswith(("M3", "M4", "M5")):
             return True
+        if self._pump_passthrough_m8_m9 and upper in {"M8", "M9"}:
+            return True
         if upper.startswith(("S", "F")):
             return True
         if upper.startswith(("G0", "G00", "G1", "G01", "G2", "G02", "G3", "G03")):
@@ -2122,6 +2656,8 @@ class HttpUpstream(UpstreamBase):
         upper = command.upper().strip()
         if self._is_job_header_line(upper):
             return False
+        if self._pump_passthrough_m8_m9 and upper in {"M8", "M9"}:
+            return True
         return upper.startswith(("G90", "G91", "G20", "G21", "G53", "G54", "G92", "M3", "M4", "M5", "F", "S"))
 
     def _is_immediate_live_motion_line(self, command: str) -> bool:
@@ -2167,9 +2703,30 @@ class HttpUpstream(UpstreamBase):
         live_prefixes = (
             "G0", "G00", "G1", "G01",
             "G90", "G91", "G20", "G21", "G53", "G54", "G92",
-            "M3", "M4", "M5", "F", "S",
+            "M3", "M4", "M5", "M8", "M9", "F", "S",
         )
         return upper.startswith(live_prefixes)
+
+    def _is_pump_command(self, command: str) -> bool:
+        return self._pump_command_token(command) in {"M8", "M9"}
+
+    def _pump_command_token(self, command: str) -> str:
+        compact = self._compact_gcode_spacing(command.upper()).replace(" ", "")
+        if compact.startswith("M8"):
+            return "M8"
+        if compact.startswith("M9"):
+            return "M9"
+        return ""
+
+    def _apply_pump_injection(self, lines: list[str]) -> list[str]:
+        if not lines:
+            return lines
+        result = list(lines)
+        if self._pump_inject_on_upload_start and "M8" not in {self._pump_command_token(line) for line in result}:
+            result.insert(0, "M8")
+        if self._pump_inject_off_upload_end and "M9" not in {self._pump_command_token(line) for line in result}:
+            result.append("M9")
+        return result
 
     def _normalize_http_response(self, command: str, text: str) -> list[str]:
         normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n ")
@@ -2213,6 +2770,7 @@ class QueuedCommand:
 class BridgeHandler(socketserver.BaseRequestHandler):
     def setup(self) -> None:
         self.config = self.server.config  # type: ignore[attr-defined]
+        self.camera_manager: CameraManager | None = getattr(self.server, "camera_manager", None)  # type: ignore[attr-defined]
         self.log = logging.getLogger(f"BridgeHandler[{self.client_address[0]}:{self.client_address[1]}]")
         self.tracker = CommandTracker()
         self.line_normalizer = LineNormalizer()
@@ -2225,14 +2783,23 @@ class BridgeHandler(socketserver.BaseRequestHandler):
         self._motion_candidate_seen = False
         self._no_motion_logged = False
         self._frame_warning_logged = False
-        self.worker = threading.Thread(target=self._command_worker, daemon=True)
-        protocol_type = self.config.get("protocol_type", "tcp")
-        self.upstream = UPSTREAM_FACTORIES[protocol_type](self.config, self)
-        self.upstream.open()
-        self.worker.start()
-        self.log.info("Client connected using upstream mode %s", protocol_type)
+        self.worker: threading.Thread | None = None
+        self.protocol_type = self.config.get("protocol_type", "tcp")
+        self.upstream = UPSTREAM_FACTORIES[self.protocol_type](self.config, self)
+        self._upstream_started = False
 
     def handle(self) -> None:
+        first_data = b""
+        try:
+            first_data = self.request.recv(4096)
+        except OSError:
+            return
+        if not first_data:
+            return
+        if self._maybe_handle_http_request(first_data):
+            return
+        self._ensure_upstream_started()
+        self._consume_client_bytes(first_data)
         while not self.closed.is_set():
             try:
                 data = self.request.recv(4096)
@@ -2247,11 +2814,148 @@ class BridgeHandler(socketserver.BaseRequestHandler):
 
     def finish(self) -> None:
         self.closed.set()
-        try:
-            self.upstream.close()
-        except Exception:
-            pass
+        if self._upstream_started:
+            try:
+                self.upstream.close()
+            except Exception:
+                pass
         self.log.info("Client disconnected")
+
+    def _ensure_upstream_started(self) -> None:
+        if self._upstream_started:
+            return
+        self.upstream.open()
+        self.worker = threading.Thread(target=self._command_worker, daemon=True)
+        self.worker.start()
+        self._upstream_started = True
+        self.log.info("Client connected using upstream mode %s", self.protocol_type)
+
+    def _maybe_handle_http_request(self, first_data: bytes) -> bool:
+        if not first_data.startswith((b"GET ", b"HEAD ")):
+            return False
+
+        request_bytes = first_data
+        while b"\r\n\r\n" not in request_bytes and b"\n\n" not in request_bytes and len(request_bytes) < 65536:
+            try:
+                more = self.request.recv(4096)
+            except OSError:
+                break
+            if not more:
+                break
+            request_bytes += more
+
+        request_text = request_bytes.decode("iso-8859-1", errors="replace")
+        request_line = request_text.splitlines()[0] if request_text else ""
+        parts = request_line.split()
+        if len(parts) < 2 or not parts[0] in {"GET", "HEAD"}:
+            return False
+
+        method = parts[0]
+        target = parts[1]
+        path = urlsplit(target).path or "/"
+        if not path.startswith("/camera/"):
+            self._send_http_response(
+                status="404 Not Found",
+                body=b"Not Found\n",
+                content_type="text/plain; charset=utf-8",
+                head_only=(method == "HEAD"),
+            )
+            return True
+
+        self.log.info("HTTP camera request %s %s", method, path)
+        if path == "/camera/capture":
+            self._handle_camera_capture_http(head_only=(method == "HEAD"))
+            return True
+        if path == "/camera/latest":
+            self._handle_camera_latest_http(head_only=(method == "HEAD"))
+            return True
+
+        self._send_http_response(
+            status="404 Not Found",
+            body=b"Not Found\n",
+            content_type="text/plain; charset=utf-8",
+            head_only=(method == "HEAD"),
+        )
+        return True
+
+    def _handle_camera_capture_http(self, *, head_only: bool) -> None:
+        if self.camera_manager is None or not self.camera_manager.enabled:
+            self._send_http_response(
+                status="503 Service Unavailable",
+                body=b"Camera capture is disabled.\n",
+                content_type="text/plain; charset=utf-8",
+                head_only=head_only,
+            )
+            return
+        try:
+            capture_path = self.camera_manager.capture(reason="http_capture")
+        except CameraCaptureError as exc:
+            self.log.warning("HTTP camera capture failed: %s", exc)
+            self._send_http_response(
+                status="503 Service Unavailable",
+                body=(f"Camera capture failed: {exc}\n").encode("utf-8"),
+                content_type="text/plain; charset=utf-8",
+                head_only=head_only,
+            )
+            return
+
+        self._send_http_response(
+            status="200 OK",
+            body=(str(capture_path) + "\n").encode("utf-8"),
+            content_type="text/plain; charset=utf-8",
+            head_only=head_only,
+        )
+
+    def _handle_camera_latest_http(self, *, head_only: bool) -> None:
+        if self.camera_manager is None:
+            self._send_http_response(
+                status="404 Not Found",
+                body=b"No camera capture manager is configured.\n",
+                content_type="text/plain; charset=utf-8",
+                head_only=head_only,
+            )
+            return
+        latest_path = self.camera_manager.latest_path
+        if not latest_path.exists():
+            self._send_http_response(
+                status="404 Not Found",
+                body=b"No latest camera image is available yet.\n",
+                content_type="text/plain; charset=utf-8",
+                head_only=head_only,
+            )
+            return
+        self._send_http_response(
+            status="200 OK",
+            body=latest_path.read_bytes(),
+            content_type="image/jpeg",
+            head_only=head_only,
+        )
+
+    def _send_http_response(
+        self,
+        *,
+        status: str,
+        body: bytes,
+        content_type: str,
+        head_only: bool,
+    ) -> None:
+        payload = [
+            f"HTTP/1.1 {status}",
+            f"Content-Type: {content_type}",
+            f"Content-Length: {len(body)}",
+            "Cache-Control: no-store",
+            "Connection: close",
+            "",
+            "",
+        ]
+        response_head = "\r\n".join(payload).encode("utf-8")
+        with self.client_lock:
+            try:
+                self.request.sendall(response_head)
+                if not head_only:
+                    self.request.sendall(body)
+            except OSError:
+                self.closed.set()
 
     def _consume_client_bytes(self, data: bytes) -> None:
         self.log.debug("RX client %r", data)
@@ -2436,6 +3140,14 @@ def main() -> int:
     protocol_log_path = resolve_protocol_log_path(config_path)
     debug_protocol_enabled = bool(config.get("http", {}).get("debug_protocol", False)) or _is_truthy(os.getenv("DEBUG_PROTOCOL"))
     configure_protocol_logging(protocol_log_path, enabled=debug_protocol_enabled)
+    camera_manager = CameraManager(config.get("camera", {}), config_path.parent)
+    if camera_manager.enabled and camera_manager.auto_capture_on_start:
+        try:
+            camera_manager.capture(reason="startup")
+            if camera_manager.open_capture_folder_on_start:
+                camera_manager.open_capture_folder()
+        except CameraCaptureError as exc:
+            logging.warning("Startup camera capture failed: %s", exc)
     retention_days = float(config.get("log_retention_days", 7.0))
     deleted_logs = prune_old_logs(log_path.parent, retention_days)
     logging.info("Writing log to %s", log_path)
@@ -2473,6 +3185,7 @@ def main() -> int:
     )
 
     with ThreadedTCPServer((listen_host, listen_port), BridgeHandler, config) as server:
+        server.camera_manager = camera_manager
         try:
             server.serve_forever(poll_interval=0.2)
         except KeyboardInterrupt:

@@ -1,25 +1,22 @@
-# RELEASE NOTES
+# Ray5 LightBurn Bridge v1.1 – Camera Overlay, Deskew Calibration, and Air Assist
 
-## v0.1.0
+This release adds a full camera-assisted LightBurn workflow for the Longer Ray5 bridge.
 
-### Summary
-Ray5 LightBurn bridge for an upload-to-Ray5 workflow.
+## Highlights
 
-### What Works
+- RTSP camera capture
+- Automatic startup snapshot
+- `latest_raw.jpg` and corrected `latest.jpg` output
+- OpenCV perspective deskew
+- Interactive 4-corner calibration tool
+- Rotation and scaling postprocess
+- DPI metadata for LightBurn drag-and-drop sizing
+- Layer-based air assist support using `M8`/`M9`
+- Cleaner `config.example.json` and safer `.gitignore`
 
-- LightBurn connection through the bridge.
-- Job upload workflow to Ray5 storage.
-- Ray5 touchscreen frame/run workflow.
-- Basic console/jog/homing passthrough where supported.
+## Notes
 
-### Known Limitations
-
-- LightBurn PC Frame button is not supported in upload-to-Ray5 mode.
-- Not a complete live USB-GRBL replacement.
-- Ray5 touchscreen should be used for Frame and Run.
-
-### Safety / Caution
-
-- Always verify framing on the Ray5 touchscreen before running.
-- Keep laser power low during testing.
-- Do not rely on PC Frame for positioning.
+- `config.json` is intentionally ignored
+- `camera_captures` and `logs` are ignored
+- Copy `config.example.json` to `config.json` and edit locally
+- Camera must remain fixed after calibration

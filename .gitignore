@@ -7,6 +7,7 @@ __pycache__/
 *.log
 lightburn_bridge_protocol.log
 logs/
+camera_captures/
 *.tmp
 *.bak
 

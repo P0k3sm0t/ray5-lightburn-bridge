@@ -1,79 +1,83 @@
-﻿# Ray5 LightBurn Bridge
+# Ray5 LightBurn Bridge
 
-This bridge connects LightBurn to a Longer Ray5 over network APIs and is intended for an upload-to-Ray5 workflow.
+Network bridge for using LightBurn with a Longer Ray5 over ESP32 HTTP APIs.
 
-## What This Bridge Does
+## Features
 
-- Accepts LightBurn GRBL-style connection on a local TCP port.
-- Translates supported live commands (status, homing, basic jog/console moves) to Ray5 network endpoints.
-- Buffers full job streams and uploads them to Ray5 storage/SD workflow.
-- Keeps GRBL-compatible status responses for LightBurn polling.
+- LightBurn to Longer Ray5 network bridge
+- ESP32 HTTP bridge workflow
+- Upload/spool mode for jobs
+- Live frame passthrough support
+- RTSP camera capture
+- Automatic startup camera capture
+- `camera_captures/latest_raw.jpg` and `camera_captures/latest.jpg` outputs
+- OpenCV deskew/perspective correction
+- `rotate_degrees` postprocess support
+- `final_size` postprocess support
+- DPI metadata writing with Pillow
+- Drag-and-drop LightBurn overlay workflow
+- `calibrate_camera.py` four-point calibration tool
+- M8/M9 air assist passthrough
+- LightBurn layer-based Air Assist usage
 
-## Intended Workflow (Recommended)
+## Install
 
-1. Create your job in LightBurn.
-2. Click Start/Play in LightBurn.
-3. The bridge auto-captures the streamed G-code and uploads it to Ray5 storage.
-4. On the Ray5 touchscreen, select the uploaded file.
-5. Use the Ray5 touchscreen Frame function.
-6. Run the job from the Ray5 touchscreen.
+```powershell
+python -m pip install -r requirements.txt
+```
 
-## LightBurn Play Auto-Capture
+## Configuration
 
-LightBurn normally streams live G-code when Start/Play is pressed.
+Copy example config:
 
-This bridge can auto-convert that stream into upload/spool mode:
+```powershell
+copy config.example.json config.json
+```
 
-1. Detects a real job stream (line count, motion density, setup/power commands).
-2. Captures lines in memory instead of live-firing the full stream.
-3. Finalizes and uploads a `.gc` file to Ray5 storage.
-4. Leaves auto-start off by default (`start_after_upload=false`).
+Edit `config.json`:
 
-After upload, use the Ray5 touchscreen to frame and run.
+- set `ray5_host`
+- set `camera.url`
+- set `deskew.source_points` after calibration
+- set `postprocess.scale`, `postprocess.final_size`, `postprocess.dpi`, `postprocess.rotate_degrees`
 
-## Important Limitation
+## Run
 
-WARNING: LightBurn PC Frame is not supported in upload-to-Ray5 mode. Use the Ray5 touchscreen Frame function after uploading the file.
+Run bridge:
 
-This bridge is not a full live USB-GRBL replacement.
+```powershell
+python ray5_lightburn_bridge.py
+```
 
-- Console/jog/homing may work depending on controller state.
-- Production jobs should use upload plus touchscreen frame/run.
+Run calibration:
 
-## Setup
+```powershell
+python calibrate_camera.py
+```
 
-1. Install Python 3.10+.
-2. Install dependencies:
-   - `pip install requests websockets`
-3. Create a local config from template values (do not commit real machine values):
-   - `RAY5_HOST=192.168.x.x`
-   - `BRIDGE_PORT=9000`
-4. Start the bridge:
-   - `python ray5_lightburn_bridge.py --config config.json`
-5. In LightBurn, add/connect a GRBL device to:
-   - Host: `127.0.0.1`
-   - Port: `9000`
+## LightBurn Camera Overlay Workflow
 
-## Debug Logging
+1. Start bridge.
+2. Bridge captures `camera_captures/latest_raw.jpg`.
+3. Bridge writes corrected `camera_captures/latest.jpg`.
+4. Drag `latest.jpg` into LightBurn.
+5. Put image on a non-output layer.
+6. Turn Output OFF for that image layer.
+7. Lock the image.
+8. Use image as placement reference.
+9. Always Frame before Start.
 
-Default mode is quiet.
+## Air Assist
 
-- Enable verbose protocol logging via env var:
-  - `DEBUG_PROTOCOL=true`
-- Or in config:
-  - `http.debug_protocol=true`
+- Enable Air Assist only on desired LightBurn layers.
+- LightBurn sends `M8` / `M9`.
+- Bridge passes `M8` / `M9` through.
+- Ray5 pump port toggles pump.
 
-When enabled, raw protocol traffic is written to `lightburn_bridge_protocol.log`.
+## Safety
 
-## Troubleshooting
-
-- If LightBurn connects but jobs do not run, verify Ray5 IP/ports and websocket sideband connectivity.
-- If status seems stale, confirm the bridge is receiving sideband status updates.
-- If upload fails, check Ray5 storage availability and upload endpoint settings.
-- If framing seems wrong, use Ray5 touchscreen Frame before running.
-
-## Privacy / Safety
-
-- Do not commit logs, IP addresses, local settings, or machine-specific config.
-- Keep laser power low during validation.
-- Always verify frame and origin on the Ray5 touchscreen before running.
+- Never publish `config.json`.
+- Do not commit passwords.
+- Camera must stay fixed after calibration.
+- Always frame before burning.
+- Use proper relay/electrical safety for 120V pump control.

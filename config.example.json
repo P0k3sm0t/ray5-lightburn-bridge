@@ -1,5 +1,5 @@
-﻿{
-  "ray5_host": "192.168.x.x",
+{
+  "ray5_host": "192.168.1.50",
   "ray5_port": 8848,
   "listen_host": "127.0.0.1",
   "listen_port": 9000,
@@ -15,15 +15,53 @@
     "recv_chunk_size": 4096
   },
   "websocket": {
-    "url": "ws://192.168.x.x:8849/ws",
-    "subprotocols": [],
-    "origin": null,
-    "append_newline": false,
-    "open_timeout_seconds": 5.0,
-    "close_timeout_seconds": 1.0
+    "url": ""
+  },
+  "pump_control": {
+    "enabled": true,
+    "passthrough_m8_m9": true,
+    "inject_on_upload_start": false,
+    "inject_off_upload_end": false
+  },
+  "camera": {
+    "enabled": true,
+    "url": "rtsp://USERNAME:PASSWORD@CAMERA_IP:554/stream2",
+    "snapshot_url": "",
+    "capture_method": "ffmpeg",
+    "output_dir": "camera_captures",
+    "filename_prefix": "ray5_bed",
+    "keep_last": 25,
+    "auto_capture_on_upload": true,
+    "auto_capture_on_start": true,
+    "open_capture_folder_on_start": false,
+    "timeout_seconds": 15,
+    "deskew": {
+      "enabled": true,
+      "source_points": [
+        [500, 300],
+        [820, 300],
+        [860, 560],
+        [460, 560]
+      ],
+      "output_size": [1200, 1200]
+    },
+    "postprocess": {
+      "enabled": true,
+      "scale": 1.0,
+      "center_crop_margin": 0,
+      "rotate_degrees": 90,
+      "final_size": [1700, 1700],
+      "dpi": 143.93,
+      "overlay_guides": {
+        "enabled": true,
+        "draw_center_cross": true,
+        "draw_border": true,
+        "draw_corner_marks": true
+      }
+    }
   },
   "http": {
-    "url": "http://192.168.x.x:8848/command",
+    "url": "http://192.168.1.50:8848/command",
     "method": "GET",
     "synthetic_grbl_handshake": true,
     "startup_banner": "Grbl 1.1f ['$' for help]",
@@ -45,23 +83,26 @@
     "synthetic_status_response": "<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000|WCO:0.000,0.000,0.000|FS:0,0>",
     "spool": {
       "enabled": true,
+      "auto_capture_live_jobs": true,
       "start_after_upload": false,
       "idle_seconds": 1.5,
+      "job_detect_window_seconds": 2.0,
+      "live_frame_passthrough": true,
       "frame_live_passthrough": true,
       "frame_idle_seconds": 0.35,
       "zero_power_frame_passthrough": true,
       "synthetic_motion_status_seconds": 2.0,
       "minimum_job_lines": 10,
       "gzip_level": 6,
-      "filename_prefix": "longer",
-      "upload_url": "http://192.168.x.x:8848/upload",
+      "filename_prefix": "lightburn_job",
+      "upload_url": "http://192.168.1.50:8848/upload",
       "upload_path": "/",
-      "files_url": "http://192.168.x.x:8848/files",
+      "files_url": "http://192.168.1.50:8848/files",
       "upload_timeout_seconds": 30.0,
       "run_command_template": "$sd/runzip=/{filename}",
       "multipart_filename_mode": "bare",
       "upload_format": "gc",
-      "plain_extension": ".gcod",
+      "plain_extension": ".gc",
       "screen_compatible_rewrite": true,
       "convert_m4_to_m3": false,
       "gzip_os_byte": 3,
