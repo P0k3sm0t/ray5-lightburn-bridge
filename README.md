@@ -1,3 +1,7 @@
+I am no longer developign this. I moved to a controller based system instead. 
+find that here:
+https://github.com/P0k3sm0t/Ray5-Pilot
+
 # Ray5 LightBurn Bridge
 
 Network bridge for using LightBurn with a Longer Ray5 over ESP32 HTTP APIs.
