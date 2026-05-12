@@ -1,4 +1,4 @@
-I am no longer developign this. I moved to a controller based system instead. 
+I am no longer developing this. I moved to a controller based system instead. 
 find that here:
 https://github.com/P0k3sm0t/Ray5-Pilot
 
